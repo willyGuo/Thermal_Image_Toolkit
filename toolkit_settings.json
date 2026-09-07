@@ -1,0 +1,30 @@
+{
+  "log_font_size": 21,
+  "raw_input": {
+    "resolution": [
+      640,
+      512
+    ],
+    "bit_depth": 14,
+    "output_root": "D:\\01_Project\\02_Loewe\\03_Novatek\\04_Develop\\03_VM\\ShareFolder\\Tiffany_thermal\\Thermal_RAW_Toolkit\\Thermal_RAW_Results"
+  },
+  "timeline": {
+    "metric": "flicker_control_score",
+    "history_seconds": 120
+  },
+  "quality_weights": {
+    "spatial": {
+      "detail_clarity_score": 22,
+      "contrast_quality_score": 18,
+      "flat_cleanliness_score": 18,
+      "thermal_uniformity_score": 16,
+      "clipping_control_score": 10,
+      "artifact_control_score": 16
+    },
+    "uvc_temporal": {
+      "spatial_quality_score": 70,
+      "flicker_control_score": 15,
+      "temporal_stability_score": 15
+    }
+  }
+}

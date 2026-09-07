@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thermal RAW Toolkit Quality Score Guide - Adaptive Clustering</title>
+<style>
+  body {
+    margin: 22px;
+    color: #e6edf2;
+    background: #202328;
+    font-family: "Segoe UI", "Microsoft JhengHei", sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+  }
+  h1 { color: #86c8f4; font-size: 25px; margin: 8px 0 6px; }
+  h2 { color: #c9e2f2; font-size: 19px; margin-top: 24px; }
+  h3 { color: #b8d8ea; font-size: 16px; margin-top: 18px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 10px; }
+  th { background: #31546c; color: #fff; padding: 8px; text-align: left; }
+  td { border: 1px solid #53606c; padding: 8px; vertical-align: top; }
+  code {
+    color: #ffd38a;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    white-space: pre-wrap;
+  }
+  .notice {
+    background: #2b323a;
+    border-left: 4px solid #d6a85f;
+    padding: 10px;
+  }
+  .info {
+    background: #243440;
+    border-left: 4px solid #5ba7d1;
+    padding: 10px;
+  }
+  .flow {
+    background: #181b1f;
+    border: 1px solid #4b5660;
+    padding: 12px;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    white-space: pre-wrap;
+    line-height: 1.45;
+  }
+  .good { color: #9fe3b1; font-weight: 600; }
+  .warn { color: #ffd38a; font-weight: 600; }
+  .small { color: #aebbc5; font-size: 13px; }
+  .nav { background: #252b31; padding: 9px; }
+  a { color: #86c8f4; }
+</style>
+</head>
+
+<body>
+<div class="nav">
+  <a href="#overview">總覽</a> |
+  <a href="#adaptive">Adaptive Clustering</a> |
+  <a href="#flat">Flat Cleanliness</a> |
+  <a href="#uniformity">Thermal Uniformity</a> |
+  <a href="#detail">Detail Clarity</a> |
+  <a href="#total">Total Score</a>
+</div>
+
+<section id="overview">
+<h1>RAW Full Quality Score Guide</h1>
+
+<p class="notice">
+<b>判讀原則：</b>所有 Score 為 0～100，越高越好。此方法屬於 No-Reference、
+同場景相對比較指標，不是絕對 PASS / FAIL 規格。RAW 評分使用原始位深資料，
+內部正規化到 0～1 後進行分析。
+</p>
+
+<h2>目前整體流程</h2>
+
+<div class="flow">Original RAW
+    ↓
+Normalize to 0~1
+    ↓
+Bilateral Filter
+    ↓
+Base Layer + Detail Layer
+    ↓
+Sobel Gradient + 9×9 Local Std
+    ↓
+┌──────────────────┬──────────────────┐
+│ Flat Mask        │ Edge Mask        │
+│                  │                  │
+│ Adaptive Gray    │ Sharpness        │
+│ Clustering       │ Detail SNR       │
+│      ↓           │ Halo             │
+│ Connected        │      ↓           │
+│ Components       │ Detail Clarity   │
+│      ↓           │                  │
+│ Region 1...N     │                  │
+│  ├ Noise σ       │                  │
+│  └ Uniform σ     │                  │
+└──────────────────┴──────────────────┘
+        ↓
+Flat Cleanliness / Thermal Uniformity
+        +
+Contrast / Clipping / Artifact
+        ↓
+Total Score</div>
+</section>
+
+<section id="adaptive">
+<h2>1. Flat Region：Adaptive Gray Clustering</h2>
+
+<p class="info">
+<b>新版重點：</b>不再把 Flat pixel 固定切成 8 個 Gray Bands。
+現在會根據本張影像 Flat pixel 的實際 Histogram，自動決定灰階 Cluster 數量與邊界。
+</p>
+
+<h3>1.1 Flat candidate 怎麼找</h3>
+<p>先對 Base Layer 計算 Sobel Gradient 與 9×9 Local Standard Deviation：</p>
+
+<p><code>Flat Gradient Threshold = clip(P35(Gradient), 0.004, 0.020)</code><br>
+<code>Flat Std Threshold = clip(P50(LocalStd), 0.008, 0.035)</code><br>
+<code>Flat Mask = low Gradient AND low LocalStd</code></p>
+
+<p>另外會把 Edge Mask 膨脹成 guard，盡量避免邊緣 transition / ringing 被誤當成 Flat noise。</p>
+
+<h3>1.2 Adaptive Gray Clustering 怎麼做</h3>
+
+<div class="flow">Flat pixels
+    ↓
+取 Base level 的 P1 ~ P99
+    ↓
+建立 128-bin Histogram
+    ↓
+1-D Gaussian Smooth (σ = 2)
+    ↓
+找 Significant Peaks
+    ↓
+移除彼此太接近的 Peak
+    ↓
+相鄰 Peak 中間找最低 Valley
+    ↓
+Valley = Cluster Boundary
+    ↓
+Adaptive Cluster 0...N</div>
+
+<table>
+<tr><th>步驟</th><th>目前做法</th><th>目的</th></tr>
+<tr>
+  <td>P1～P99</td>
+  <td>只用 Flat pixel 主要灰階範圍建立 Histogram。</td>
+  <td>避免極少量極端值影響分群。</td>
+</tr>
+<tr>
+  <td>Histogram</td>
+  <td>預設 128 bins。</td>
+  <td>保留足夠灰階結構，又不讓單一 DN noise 造成太多小峰。</td>
+</tr>
+<tr>
+  <td>Smoothing</td>
+  <td>1-D Gaussian，σ = 2。</td>
+  <td>抑制小型 histogram ripple。</td>
+</tr>
+<tr>
+  <td>Peak Detection</td>
+  <td>Peak 必須是 local maximum，且具最低 histogram support。</td>
+  <td>只保留真正有代表性的亮度 population。</td>
+</tr>
+<tr>
+  <td>Peak Merge</td>
+  <td>Peak 之間必須保有最小距離。</td>
+  <td>避免同一片寬廣表面被拆成很多群。</td>
+</tr>
+<tr>
+  <td>Valley Split</td>
+  <td>相鄰有效 Peak 之間找最低 Histogram Valley。</td>
+  <td>用場景本身的亮度分布決定 Cluster 邊界。</td>
+</tr>
+</table>
+
+<p><b>Cluster 數量不是固定值。</b> 某張圖可能只有 2 群，另一張可能有 4、5、6 群。
+目前設定 <b>最多 8 個 Cluster</b>，只是防止過度分群，不代表一定會產生 8 群。</p>
+
+<h3>1.3 為什麼 Adaptive 比固定 8 Bands 好</h3>
+
+<table>
+<tr><th>固定 8 Bands</th><th>Adaptive Gray Clustering</th></tr>
+<tr>
+  <td>固定每一段灰階範圍切割。</td>
+  <td>根據實際 Histogram 自動決定邊界。</td>
+</tr>
+<tr>
+  <td>同一表面可能剛好跨 Band 邊界而被硬拆開。</td>
+  <td>同一亮度 population 比較有機會保留在同一 Cluster。</td>
+</tr>
+<tr>
+  <td>場景只有 2 個主要亮度區，也仍然硬切成多個 Band。</td>
+  <td>場景有幾個主要亮度 population，就形成幾個有效 Cluster。</td>
+</tr>
+</table>
+
+<h3>1.4 Cluster 後仍要做 Connected Components</h3>
+
+<p>Gray Cluster 只代表「亮度接近」，不代表空間上是同一個物體。因此每一個 Adaptive Cluster
+還會再做：</p>
+
+<p><code>cv2.connectedComponentsWithStats(..., connectivity=8)</code></p>
+
+<p>使用 8-connectivity，可連接上下、左右與斜對角相鄰 pixel。</p>
+
+<div class="flow">Adaptive Cluster 2
+    ↓
+可能同時包含：
+左牆 + 右牆 + 地板的一小塊
+    ↓
+8-connectivity Connected Components
+    ↓
+Region A = 左牆
+Region B = 右牆
+Region C = 地板</div>
+
+<p>每個有效 Region 最小面積：</p>
+<p><code>minimum_area = max(96, ceil(ImagePixels × 0.0015))</code></p>
+
+<p>過小的碎片會被排除，避免小型誤分割 Region 支配 Worst score。</p>
+</section>
+
+<section id="flat">
+<h2>2. Flat Cleanliness</h2>
+
+<p>每個有效 Flat Region 都各自計算高頻 Noise：</p>
+
+<p><code>Detail = Original - Base</code></p>
+
+<p><code>Noise σ = 1.4826 × median(|Detail - median(Detail)|)</code></p>
+
+<p>這裡使用 MAD Robust Sigma，不是直接對原始灰階做 Standard Deviation。</p>
+
+<h3>2.1 Region 聚合</h3>
+
+<p>假設每個 Region 都已得到一個 <code>noise_sigma</code>：</p>
+
+<table>
+<tr><th>聚合項目</th><th>計算方式</th><th>用途</th></tr>
+<tr>
+  <td><b>Typical Noise</b></td>
+  <td>依 Region Area 加權的 P50。</td>
+  <td>代表大部分有效 Flat Area 的典型 noise。</td>
+</tr>
+<tr>
+  <td><b>Worst Noise</b></td>
+  <td>各有效 Region Noise 的 P80，不按 Area 加權。</td>
+  <td>避免大面積乾淨天空掩蓋較小但較差的牆面。</td>
+</tr>
+</table>
+
+<h3>2.2 Noise 轉成分數</h3>
+
+<p><code>Typical Noise Score = 100 × exp(-TypicalNoise / 0.025)</code><br>
+<code>Worst Noise Score   = 100 × exp(-WorstNoise / 0.025)</code></p>
+
+<p><code>Robust Noise Score = 65% × Typical + 35% × Worst</code></p>
+
+<h3>2.3 Impulse Noise</h3>
+
+<p>MAD 對極少數 hot / cold pixel 不敏感，因此另外利用 3×3 Median residual
+找 isolated impulse，並限制 Connected Component 最大為 4 pixels。</p>
+
+<p><code>Flat Cleanliness = 85% × Robust Noise Score + 15% × Impulse Control</code></p>
+
+<p class="good">高分代表：平坦區顆粒少，而且少量孤立 hot/cold pixel 也受到控制。</p>
+</section>
+
+<section id="uniformity">
+<h2>3. Thermal Uniformity</h2>
+
+<p>Uniformity 主要看較低頻的局部不均與固定條紋，不是 factory NUC 的 MinDN / MaxDN 規格。</p>
+
+<p><code>Broad Base = GaussianBlur(Base, σ = 5)</code><br>
+<code>Uniform Residual = Base - Broad Base</code></p>
+
+<p>每一個 Adaptive / Connected Region 都各自計算：</p>
+
+<p><code>Uniform σ = 1.4826 × MAD(Uniform Residual)</code></p>
+
+<h3>3.1 Typical / Worst</h3>
+<p><code>Typical Uniformity = Area-weighted P50</code><br>
+<code>Worst Uniformity = Region P80 (unweighted)</code></p>
+
+<p><code>Typical Uniformity Score = 100 × exp(-Typical / 0.020)</code><br>
+<code>Worst Uniformity Score   = 100 × exp(-Worst / 0.020)</code></p>
+
+<h3>3.2 Banding Control</h3>
+
+<p>另外從 Flat 區檢查 Row / Column banding。固定垂直條紋通常會反映在 Column profile，
+固定水平條紋則會反映在 Row profile。</p>
+
+<p><code>Banding Score = 100 × exp(-BandingSigma / 0.012)</code></p>
+
+<p>Banding 越明顯 → Banding Sigma 越大 → Banding Score 越低。</p>
+
+<h3>3.3 Thermal Uniformity 最終分數</h3>
+
+<p><code>Thermal Uniformity =
+50% × Typical Uniformity Score
++ 30% × Worst Uniformity Score
++ 20% × Banding Control</code></p>
+
+<p class="good">高分代表：各 Flat Region 都較平，而且水平 / 垂直 fixed-pattern stripe 較少。</p>
+</section>
+
+<section id="detail">
+<h2>4. Detail Clarity</h2>
+
+<h3>4.1 Sharpness</h3>
+<p>對 Base Layer 使用 3×3 Sobel Gradient，Edge Region 的平均 Gradient 作為 Edge Strength。</p>
+
+<p><code>Sharpness Score = clip(EdgeStrength / 0.16 × 100)</code></p>
+
+<p>Sharpness 高代表邊緣變化快，但單看 Sharpness 可能把 Noise amplification 誤認為細節提升。</p>
+
+<h3>4.2 Detail SNR</h3>
+
+<p><code>Edge Detail = mean(|Detail| at Edge Mask)</code><br>
+<code>Reference Noise = max(Typical Flat Noise, 1/255)</code><br>
+<code>Detail SNR = Edge Detail / Reference Noise</code></p>
+
+<p><code>Detail SNR Score = clip(DetailSNR / 5 × 100)</code></p>
+
+<p>Detail SNR 高代表真正 Edge / Detail 明顯高於 Flat Noise。</p>
+
+<h3>4.3 Halo Penalty</h3>
+
+<p>RAW Full 使用 edge-normal overshoot / undershoot 檢查 Halo：</p>
+
+<p><code>Halo Penalty = clip((HaloRatio - 0.10) / 0.50 × 100)</code></p>
+
+<h3>4.4 Detail Clarity 最終分數</h3>
+
+<p><code>Detail Clarity =
+50% × Sharpness
++ 50% × Detail SNR
+- 8% × Halo Penalty</code></p>
+
+<p class="good">高分代表：邊緣銳利、細節高於 Noise，而且不是靠過度 sharpening 製造 halo。</p>
+</section>
+
+<section>
+<h2>5. Contrast Quality</h2>
+
+<p><code>Contrast Span = P99 - P1</code><br>
+<code>Span Score = clip(ContrastSpan / 0.60 × 100)</code><br>
+<code>Entropy Score = clip(EntropyBits / 7 × 100)</code></p>
+
+<p><code>Contrast Quality = 70% × Span Score + 30% × Entropy Score</code></p>
+
+<p>加入 Entropy 是避免只靠少量極端 pixel 把 P1～P99 range 拉大就得到高分。</p>
+</section>
+
+<section>
+<h2>6. Clipping Control</h2>
+
+<p>統計靠近黑端 / 白端的 pixel 比例：</p>
+
+<p><code>Clipping Control = 100 × exp(-ClippingPercent / 3)</code></p>
+
+<p class="good">高分代表：AGC / Contrast Enhancement 較少造成黑白細節被 clipping。</p>
+</section>
+
+<section>
+<h2>7. Artifact Control</h2>
+
+<p>主要檢查：</p>
+<ul>
+  <li>Halo / Ringing</li>
+  <li>Horizontal / Vertical Seam</li>
+  <li>Repeated Grid / Block Pattern</li>
+</ul>
+
+<p><code>Artifact Control =
+50% × Halo Control
++ 50% × Seam Control</code></p>
+
+<p>重複且接近週期性的 seam / grid 會比單一自然物體邊界受到更高懲罰。</p>
+</section>
+
+<section id="total">
+<h2>8. RAW Total Score</h2>
+
+<table>
+<tr><th>項目</th><th>權重</th></tr>
+<tr><td>Detail Clarity</td><td>22%</td></tr>
+<tr><td>Contrast Quality</td><td>18%</td></tr>
+<tr><td>Flat Cleanliness</td><td>18%</td></tr>
+<tr><td>Thermal Uniformity</td><td>16%</td></tr>
+<tr><td>Clipping Control</td><td>10%</td></tr>
+<tr><td>Artifact Control</td><td>16%</td></tr>
+</table>
+
+<p><code>Total =
+0.22 × Detail Clarity
++ 0.18 × Contrast Quality
++ 0.18 × Flat Cleanliness
++ 0.16 × Thermal Uniformity
++ 0.10 × Clipping Control
++ 0.16 × Artifact Control</code></p>
+
+<h2>9. Quality Confidence</h2>
+
+<p>Quality Confidence 不加入 Total Score，只表示本張影像有多少可用的 Flat / Edge / Region
+可支撐本次分析。</p>
+
+<p class="notice">
+<b>建議使用方式：</b>比較 Enhancement 演算法時，盡量使用同一場景、同一 RAW source、
+同一 bit depth、相同裁切範圍。Total Score 可用來快速排序，但仍建議同時觀察各子分數，
+特別是 Detail Clarity、Flat Cleanliness、Thermal Uniformity 與 Artifact Control。
+</p>
+</section>
+
+</body>
+</html>
