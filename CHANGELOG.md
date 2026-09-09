@@ -1,5 +1,13 @@
 # Thermal RAW Toolkit
 
+## v1.3.0 — 2026-09-09
+
+- Add persistent horizontal mirror controls for Camera A and Camera B. Camera A mirroring also applies to Single UVC Statistic and UVC Algorithm Compare.
+- Export original RAW DN matrices as CSV from the three Image save workflows.
+- Add optional filled white BPR point highlights with independent bright-point and red-circle radius controls, live preview, marked-image output and summary metadata.
+
+Validation: Python syntax, settings round-trip, GUI construction, mirror routing and BPR marker rendering checks passed. No EXE was built; physical-camera behavior remains unverified.
+
 ## v1.2.0 — 2026-09-07
 
 Changes relative to v1.1.0:

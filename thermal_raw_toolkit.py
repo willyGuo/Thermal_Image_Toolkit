@@ -44,7 +44,7 @@ except (ImportError, OSError):
     QCameraInfo = None
 
 
-APP_VERSION = "v1.2.0"
+APP_VERSION = "v1.3.0"
 APP_TITLE = f"Thermal RAW Toolkit {APP_VERSION}"
 
 
@@ -80,6 +80,10 @@ def default_toolkit_settings():
         "timeline": {
             "metric": "overall_score",
             "history_seconds": 60,
+        },
+        "camera_mirror": {
+            "camera_a": True,
+            "camera_b": False,
         },
         "quality_weights": {
             "spatial": dict(DEFAULT_SPATIAL_QUALITY_WEIGHTS),
@@ -131,6 +135,13 @@ def validated_toolkit_settings(settings):
     result["timeline"]["history_seconds"] = int(
         np.clip(timeline.get("history_seconds", 60), 10, 600)
     )
+    camera_mirror = settings.get("camera_mirror", {})
+    if not isinstance(camera_mirror, dict):
+        camera_mirror = {}
+    result["camera_mirror"] = {
+        "camera_a": bool(camera_mirror.get("camera_a", True)),
+        "camera_b": bool(camera_mirror.get("camera_b", False)),
+    }
     source_weights = settings.get("quality_weights", {})
     for section, defaults_for_section in (
         ("spatial", DEFAULT_SPATIAL_QUALITY_WEIGHTS),
@@ -293,6 +304,7 @@ def enumerate_camera_devices():
 
 
 BPR_MARK_RADIUS = 5
+BPR_HIGHLIGHT_RADIUS = 2
 IMAGE_ALGORITHM_OPTIONS = [
     ("Percentile Auto Contrast", "auto_contrast"),
     ("Fieldscale Local Adaptive AGC (Firmware Core)", "fieldscale"),
@@ -3131,7 +3143,13 @@ def format_bpr_coordinate_report(table_info, coordinates, outside_coordinates, w
     return "\n".join(lines)
 
 
-def draw_bpr_markers(base_gray, coordinates, radius=BPR_MARK_RADIUS):
+def draw_bpr_markers(
+    base_gray,
+    coordinates,
+    radius=BPR_MARK_RADIUS,
+    highlight_bright_points=False,
+    highlight_radius=BPR_HIGHLIGHT_RADIUS,
+):
     if cv2 is None:
         raise RuntimeError("OpenCV is required for BPR marking. Install: pip install opencv-python")
     if base_gray.ndim != 2:
@@ -3149,6 +3167,15 @@ def draw_bpr_markers(base_gray, coordinates, radius=BPR_MARK_RADIUS):
             1,
             cv2.LINE_AA,
         )
+        if highlight_bright_points:
+            cv2.circle(
+                marked_rgb,
+                (int(x), int(y)),
+                int(highlight_radius),
+                (255, 255, 255),
+                -1,
+                cv2.LINE_AA,
+            )
     return marked_rgb
 
 
@@ -3928,6 +3955,15 @@ class ToolkitSettingsDialog(QDialog):
         general_form.addRow("Resolution", self.resolution_combo)
         general_form.addRow("Bit Depth", self.bit_depth_combo)
         general_form.addRow("Output Root", self.output_root_row)
+        self.camera_a_mirror_check = QCheckBox("Mirror Camera A horizontally")
+        self.camera_b_mirror_check = QCheckBox("Mirror Camera B horizontally")
+        mirror_options = QWidget()
+        mirror_layout = QVBoxLayout(mirror_options)
+        mirror_layout.setContentsMargins(0, 0, 0, 0)
+        mirror_layout.setSpacing(6)
+        mirror_layout.addWidget(self.camera_a_mirror_check)
+        mirror_layout.addWidget(self.camera_b_mirror_check)
+        general_form.addRow("Camera Mirror", mirror_options)
         self.tabs.addTab(general_page, "General")
 
         appearance_page = QWidget()
@@ -4018,6 +4054,8 @@ class ToolkitSettingsDialog(QDialog):
         self.output_root_row.edit.textChanged.connect(
             self.clear_apply_status
         )
+        self.camera_a_mirror_check.toggled.connect(self.clear_apply_status)
+        self.camera_b_mirror_check.toggled.connect(self.clear_apply_status)
         self.log_font_spin.valueChanged.connect(self.clear_apply_status)
         self.timeline_metric_combo.currentIndexChanged.connect(
             self.clear_apply_status
@@ -4057,6 +4095,9 @@ class ToolkitSettingsDialog(QDialog):
         )
         self.bit_depth_combo.setCurrentIndex(max(bit_depth_index, 0))
         self.output_root_row.setText(raw_input["output_root"])
+        camera_mirror = settings["camera_mirror"]
+        self.camera_a_mirror_check.setChecked(camera_mirror["camera_a"])
+        self.camera_b_mirror_check.setChecked(camera_mirror["camera_b"])
         self.log_font_spin.setValue(settings["log_font_size"])
         timeline = settings["timeline"]
         metric_index = self.timeline_metric_combo.findData(timeline["metric"])
@@ -4080,6 +4121,10 @@ class ToolkitSettingsDialog(QDialog):
             "timeline": {
                 "metric": self.timeline_metric_combo.currentData(),
                 "history_seconds": self.timeline_history_spin.value(),
+            },
+            "camera_mirror": {
+                "camera_a": self.camera_a_mirror_check.isChecked(),
+                "camera_b": self.camera_b_mirror_check.isChecked(),
             },
             "quality_weights": {
                 "spatial": {
@@ -7277,6 +7322,15 @@ class ThermalRawToolkit(QMainWindow):
         self.bpr_circle_radius = FocusWheelSpinBox()
         self.bpr_circle_radius.setRange(1, 20)
         self.bpr_circle_radius.setValue(BPR_MARK_RADIUS)
+        self.bpr_highlight_bright_points = QualityScoreCheckBox(
+            "Highlight bright points"
+        )
+        highlight_font = self.bpr_highlight_bright_points.font()
+        highlight_font.setWeight(QFont.Normal)
+        self.bpr_highlight_bright_points.setFont(highlight_font)
+        self.bpr_highlight_radius = FocusWheelSpinBox()
+        self.bpr_highlight_radius.setRange(1, 20)
+        self.bpr_highlight_radius.setValue(BPR_HIGHLIGHT_RADIUS)
         self.bpr_note = QLabel()
         self.bpr_note.setWordWrap(True)
         self.bpr_note.setStyleSheet(
@@ -7296,6 +7350,13 @@ class ThermalRawToolkit(QMainWindow):
             row.edit.returnPressed.connect(self.auto_preview_bpr)
         self.bpr_use_raw.toggled.connect(self.auto_preview_bpr)
         self.bpr_circle_radius.valueChanged.connect(self.auto_preview_bpr)
+        self.bpr_highlight_bright_points.toggled.connect(
+            self.auto_preview_bpr
+        )
+        self.bpr_highlight_bright_points.toggled.connect(
+            self.update_bpr_marking_ui
+        )
+        self.bpr_highlight_radius.valueChanged.connect(self.auto_preview_bpr)
         self.bit_depth_combo.currentIndexChanged.connect(self.auto_preview_bpr)
         self.bpr_use_raw.toggled.connect(self.update_bpr_marking_ui)
         self.resolution_combo.currentIndexChanged.connect(self.auto_preview_bpr)
@@ -7303,7 +7364,9 @@ class ThermalRawToolkit(QMainWindow):
         f.addRow("BPR Table / Coordinates", self.bpr_coordinate_file)
         f.addRow("Background", self.bpr_use_raw)
         f.addRow("Image File", self.bpr_raw_file)
-        f.addRow("Circle Radius", self.bpr_circle_radius)
+        f.addRow("Red Circle Radius", self.bpr_circle_radius)
+        f.addRow("Bright Point", self.bpr_highlight_bright_points)
+        f.addRow("Bright Point Radius", self.bpr_highlight_radius)
         f.addRow(self.bpr_note)
         f.addRow("Bad Pixel Information", self.bpr_coordinate_info)
         self.stack.addWidget(p)
@@ -7895,6 +7958,11 @@ class ThermalRawToolkit(QMainWindow):
             self.bpr_form,
             self.bpr_raw_file,
             self.bpr_use_raw.isChecked(),
+        )
+        self.set_form_parameter_visible(
+            self.bpr_form,
+            self.bpr_highlight_radius,
+            self.bpr_highlight_bright_points.isChecked(),
         )
 
     def update_bpr_coordinate_note(self, _index=None):
@@ -8877,6 +8945,14 @@ class ThermalRawToolkit(QMainWindow):
         }
         save_png(out / outputs["image_a"], display_a)
         save_png(out / outputs["image_b"], display_b)
+        if info_a["source_type"] == "raw":
+            outputs["raw_csv_a"] = "raw_a_dn.csv"
+            save_csv_matrix(out / outputs["raw_csv_a"], raw_a, "%d")
+            self.log.append(f"Saved RAW A DN CSV: {out / outputs['raw_csv_a']}")
+        if info_b["source_type"] == "raw":
+            outputs["raw_csv_b"] = "raw_b_dn.csv"
+            save_csv_matrix(out / outputs["raw_csv_b"], raw_b, "%d")
+            self.log.append(f"Saved RAW B DN CSV: {out / outputs['raw_csv_b']}")
         comparison = self.compose_dual_image_preview([display_a, display_b])
         save_rgb_png(out / outputs["comparison"], cv2.cvtColor(comparison, cv2.COLOR_BGR2RGB))
         self.log.append(f"Saved comparison preview: {out / outputs['comparison']}")
@@ -8982,6 +9058,11 @@ class ThermalRawToolkit(QMainWindow):
         manifest_path = out / "analysis.json"
         summary_path = out / "analysis_summary.txt"
         save_png(preview_path, display)
+        raw_csv_path = None
+        if self.raw_viewer_info["source_type"] == "raw":
+            raw_csv_path = out / "original_raw_dn.csv"
+            save_csv_matrix(raw_csv_path, raw, "%d")
+            self.log.append(f"Saved original RAW DN CSV: {raw_csv_path}")
         save_rgb_png(histogram_path, self.raw_viewer_histogram_rgb)
         save_png(base_path, self.raw_viewer_quality["base_u8"])
         save_png(detail_path, self.raw_viewer_quality["detail_u8"])
@@ -8999,6 +9080,9 @@ class ThermalRawToolkit(QMainWindow):
             "statistics": dict(stats),
             "quality": quality_analysis_manifest(self.raw_viewer_quality),
             "preview_output": preview_path.name,
+            "raw_csv_output": (
+                raw_csv_path.name if raw_csv_path is not None else None
+            ),
             "histogram_output": histogram_path.name,
             "histogram_display_bins": 256,
             "excel_output": excel_path.name,
@@ -9265,11 +9349,22 @@ class ThermalRawToolkit(QMainWindow):
             if not valid_coordinates:
                 raise ValueError(f"No BPR coordinates are inside the {width}x{height} image.")
             radius = self.bpr_circle_radius.value()
+            highlight_bright_points = (
+                self.bpr_highlight_bright_points.isChecked()
+            )
+            highlight_radius = self.bpr_highlight_radius.value()
             base_rgb = np.repeat(base_gray[:, :, np.newaxis], 3, axis=2)
-            marked_rgb = draw_bpr_markers(base_gray, valid_coordinates, radius)
+            marked_rgb = draw_bpr_markers(
+                base_gray,
+                valid_coordinates,
+                radius,
+                highlight_bright_points,
+                highlight_radius,
+            )
             self._bpr_preview = (coordinate_path, coordinates, table_info, outside_coordinates,
                                  coordinate_report, raw_path, background_mode, base_filename,
-                                 width, height, radius, base_rgb, marked_rgb)
+                                 width, height, radius, highlight_bright_points,
+                                 highlight_radius, base_rgb, marked_rgb)
             self.current_original, self.current_result = base_rgb, marked_rgb
             self.preview_original.set_array(base_rgb)
             self.preview_result.set_array(marked_rgb)
@@ -9288,7 +9383,8 @@ class ThermalRawToolkit(QMainWindow):
             return
         (coordinate_path, coordinates, table_info, outside_coordinates,
          coordinate_report, raw_path, background_mode, base_filename,
-         width, height, radius, base_rgb, marked_rgb) = cached
+         width, height, radius, highlight_bright_points, highlight_radius,
+         base_rgb, marked_rgb) = cached
         out = self.make_output("bpr_bad_pixel_marking")
         base_path = out / base_filename
         marked_path = out / "bad_pixels_marked.png"
@@ -9312,6 +9408,12 @@ class ThermalRawToolkit(QMainWindow):
             if raw_path:
                 summary.write(f"Image source: {raw_path}\n")
             summary.write(f"Circle radius: {radius} px\n")
+            summary.write(
+                "Bright point highlight: "
+                f"{'enabled' if highlight_bright_points else 'disabled'}\n"
+            )
+            if highlight_bright_points:
+                summary.write(f"Bright point radius: {highlight_radius} px\n")
             summary.write("\n")
             summary.write(coordinate_report)
             summary.write("\n")
@@ -9361,6 +9463,11 @@ class ThermalRawToolkit(QMainWindow):
         detail_final_path = out / "detail_final.png"
         quality_excel_path = out / "quality_analysis.xlsx"
         save_png(original_path, raw8)
+        raw_csv_path = None
+        if self.raw_algorithm_info["source_type"] == "raw":
+            raw_csv_path = out / "original_raw_dn.csv"
+            save_csv_matrix(raw_csv_path, raw, "%d")
+            self.log.append(f"Saved original RAW DN CSV: {raw_csv_path}")
         save_png(mapping_path, pipeline_input)
         for record in records:
             step_path = out / (
@@ -9409,6 +9516,9 @@ class ThermalRawToolkit(QMainWindow):
             "execution": pipeline_execution_json(records),
             "total_ms": round(total_ms, 3),
             "original_output": original_path.name,
+            "raw_csv_output": (
+                raw_csv_path.name if raw_csv_path is not None else None
+            ),
             "final_output": result_path.name,
             "overview_output": overview_path.name,
             "quality_original": quality_analysis_manifest(quality_original),
@@ -10411,6 +10521,8 @@ class ThermalRawToolkit(QMainWindow):
             if gray.dtype == np.uint8
             else raw_to_display_u8(gray, self.raw_max)
         )
+        if self.app_settings["camera_mirror"]["camera_a"]:
+            display = np.ascontiguousarray(display[:, ::-1])
         self.viewer_uvc_frame = display
         if self.viewer_uvc_quality_enabled.isChecked():
             self.viewer_uvc_temporal_tracker.add_frame(display, frame_time)
@@ -10874,6 +10986,9 @@ class ThermalRawToolkit(QMainWindow):
             if gray.dtype == np.uint8
             else raw_to_display_u8(gray, self.raw_max)
         )
+        mirror_key = "camera_a" if camera_key == "a" else "camera_b"
+        if self.app_settings["camera_mirror"][mirror_key]:
+            display = np.ascontiguousarray(display[:, ::-1])
         now = time.perf_counter() if frame_time is None else float(frame_time)
         if self.dual_uvc_quality_enabled.isChecked():
             if camera_key == "a":
@@ -12414,6 +12529,8 @@ class ThermalRawToolkit(QMainWindow):
         processing_worker = self.uvc_processing_worker
         if processing_worker is None or not processing_worker.isRunning():
             return
+        if self.app_settings["camera_mirror"]["camera_a"]:
+            frame = np.ascontiguousarray(frame[:, ::-1])
         try:
             config = self.build_uvc_processing_config()
         except Exception as exc:
@@ -12785,6 +12902,7 @@ class ThermalRawToolkit(QMainWindow):
         else:
             save_png(path, preview_to_save)
         self.log.append(f"Saved preview: {path}")
+
     def open_last_result(self):
         if not self.last_output_dir or not os.path.isdir(self.last_output_dir):
             QMessageBox.information(self,"No Result","No result folder yet."); return

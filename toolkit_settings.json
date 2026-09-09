@@ -12,6 +12,10 @@
     "metric": "flicker_control_score",
     "history_seconds": 120
   },
+  "camera_mirror": {
+    "camera_a": true,
+    "camera_b": false
+  },
   "quality_weights": {
     "spatial": {
       "detail_clarity_score": 22,
