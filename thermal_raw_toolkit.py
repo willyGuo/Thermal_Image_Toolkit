@@ -44,7 +44,7 @@ except (ImportError, OSError):
     QCameraInfo = None
 
 
-APP_VERSION = "v1.3.0"
+APP_VERSION = "v1.4.0"
 APP_TITLE = f"Thermal RAW Toolkit {APP_VERSION}"
 
 
@@ -60,13 +60,20 @@ def bundled_resource_path(filename):
     return Path(getattr(sys, "_MEIPASS", source_path.parent)) / filename
 
 
-def toolkit_settings_path():
-    root = (
+def toolkit_root_path():
+    return (
         Path(sys.executable).resolve().parent
         if getattr(sys, "frozen", False)
         else Path(__file__).resolve().parent
     )
-    return root / "toolkit_settings.json"
+
+
+def toolkit_settings_path():
+    return toolkit_root_path() / "toolkit_settings.json"
+
+
+def default_output_root():
+    return str(toolkit_root_path() / "Thermal_RAW_Results")
 
 
 def default_toolkit_settings():
@@ -75,7 +82,7 @@ def default_toolkit_settings():
         "raw_input": {
             "resolution": [DEFAULT_WIDTH, DEFAULT_HEIGHT],
             "bit_depth": DEFAULT_BIT_DEPTH,
-            "output_root": str(Path.cwd() / "Thermal_RAW_Results"),
+            "output_root": default_output_root(),
         },
         "timeline": {
             "metric": "overall_score",
@@ -120,7 +127,7 @@ def validated_toolkit_settings(settings):
         bit_depth = DEFAULT_BIT_DEPTH
     output_root = str(raw_input.get("output_root", "")).strip()
     if not output_root:
-        output_root = str(Path.cwd() / "Thermal_RAW_Results")
+        output_root = default_output_root()
     result["raw_input"] = {
         "resolution": list(resolution),
         "bit_depth": bit_depth,
@@ -3365,6 +3372,106 @@ class PreviewLabel(QLabel):
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.LeftButton:
+            self.double_clicked.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+
+class SwipeCompareWidget(QWidget):
+    double_clicked = pyqtSignal()
+    position_changed = pyqtSignal(float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.frames = (None, None)
+        self.names = ("Image A", "Image B")
+        self.position = 0.5
+        self.dragging = False
+        self.setMinimumSize(360, 200)
+        self.setMouseTracking(True)
+
+    def set_frames(self, frames, names):
+        self.frames = tuple(frames)
+        self.names = tuple(names)
+        self.update()
+
+    def set_position(self, position):
+        self.position = max(0.0, min(1.0, float(position)))
+        self.update()
+
+    def image_rect(self):
+        if any(frame is None for frame in self.frames):
+            return QRectF()
+        width = max(frame.width() for frame in self.frames)
+        height = max(frame.height() for frame in self.frames)
+        scale = min(self.width() / width, self.height() / height)
+        return QRectF((self.width() - width * scale) / 2,
+                      (self.height() - height * scale) / 2,
+                      width * scale, height * scale)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#000000"))
+        area = self.image_rect()
+        if area.isEmpty():
+            painter.setPen(QColor("#aeb7c2"))
+            painter.drawText(self.rect(), Qt.AlignCenter, "Waiting for both images...")
+            return
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        split = area.left() + area.width() * self.position
+        clips = (QRectF(area.left(), area.top(), split - area.left(), area.height()),
+                 QRectF(split, area.top(), area.right() - split, area.height()))
+        for frame, clip in zip(self.frames, clips):
+            scale = min(area.width() / frame.width(), area.height() / frame.height())
+            target = QRectF(0, 0, frame.width() * scale, frame.height() * scale)
+            target.moveCenter(area.center())
+            painter.save()
+            painter.setClipRect(clip)
+            painter.drawPixmap(target, frame, QRectF(frame.rect()))
+            painter.restore()
+        painter.setPen(QPen(QColor("#ffffff"), 2))
+        painter.drawLine(QPointF(split, area.top()), QPointF(split, area.bottom()))
+        font = QFont("Segoe UI", 11)
+        font.setBold(False)
+        painter.setFont(font)
+        for name, alignment in zip(self.names, (Qt.AlignLeft, Qt.AlignRight)):
+            label = QRectF(area.left() + 10, area.top() + 8, max(0, area.width() - 20), 26)
+            painter.setPen(QColor("#000000"))
+            painter.drawText(label.translated(1, 1), alignment | Qt.AlignVCenter, name)
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(label, alignment | Qt.AlignVCenter, name)
+
+    def mousePressEvent(self, event):
+        area = self.image_rect()
+        split = area.left() + area.width() * self.position
+        if (event.button() == Qt.LeftButton and not area.isEmpty()
+                and area.top() <= event.y() <= area.bottom()
+                and abs(event.x() - split) <= 16):
+            self.dragging = True
+            self.setCursor(Qt.SplitHCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        area = self.image_rect()
+        if not area.isEmpty():
+            if self.dragging:
+                self.set_position((event.x() - area.left()) / area.width())
+                self.position_changed.emit(self.position)
+            near_bar = abs(event.x() - area.left() - area.width() * self.position) <= 16
+            self.setCursor(Qt.SplitHCursor if self.dragging or near_bar else Qt.ArrowCursor)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.dragging = False
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.dragging = False
             self.double_clicked.emit()
             event.accept()
             return
@@ -6621,6 +6728,15 @@ class ThermalRawToolkit(QMainWindow):
         splitter.addWidget(left)
 
         right = QWidget(); right.setObjectName("previewPanel"); right_lay = QVBoxLayout(right)
+        self.dual_compare_controls = QWidget()
+        compare_controls_layout = QHBoxLayout(self.dual_compare_controls)
+        compare_controls_layout.setContentsMargins(0, 0, 0, 0)
+        compare_controls_layout.addWidget(QLabel("Comparison View"))
+        self.dual_compare_mode = QComboBox()
+        self.dual_compare_mode.addItems(["Side by Side", "Swipe Compare"])
+        compare_controls_layout.addWidget(self.dual_compare_mode)
+        compare_controls_layout.addStretch()
+        self.dual_compare_controls.hide()
         self.right_splitter = QSplitter(Qt.Vertical)
         self.right_splitter.setHandleWidth(6)
         self.right_splitter.setChildrenCollapsible(True)
@@ -6661,6 +6777,14 @@ class ThermalRawToolkit(QMainWindow):
         result_preview_layout.addWidget(self.preview_result, 1)
         previews.addWidget(self.preview_original_container, 1)
         previews.addWidget(self.preview_result_container, 1)
+        self.dual_swipe_preview = SwipeCompareWidget()
+        previews.addWidget(self.dual_swipe_preview, 1)
+        self.dual_swipe_preview.hide()
+        self.dual_swipe_preview.double_clicked.connect(
+            lambda: self.open_preview_window(self.preview_original)
+        )
+        self.dual_swipe_preview.position_changed.connect(self.sync_dual_swipe_position)
+        self.dual_compare_mode.currentIndexChanged.connect(self.update_dual_compare_mode)
         self.right_splitter.addWidget(preview_area)
 
         self.info_area = QWidget()
@@ -7405,11 +7529,30 @@ class ThermalRawToolkit(QMainWindow):
         for name, tag in DUAL_UVC_IMAGE_NAME_OPTIONS:
             self.dual_image_name_a.addItem(name, tag)
             self.dual_image_name_b.addItem(name, tag)
+        self.dual_image_custom_name_a = QLineEdit()
+        self.dual_image_custom_name_b = QLineEdit()
+        name_fields = []
+        for combo, custom, fallback in (
+            (self.dual_image_name_a, self.dual_image_custom_name_a, "Image A"),
+            (self.dual_image_name_b, self.dual_image_custom_name_b, "Image B"),
+        ):
+            combo.addItem("Custom...", "custom")
+            custom.setPlaceholderText(f"Enter a name (default: {fallback})")
+            custom.setMaxLength(80)
+            custom.hide()
+            field = QWidget()
+            field_layout = QVBoxLayout(field)
+            field_layout.setContentsMargins(0, 0, 0, 0)
+            field_layout.setSpacing(4)
+            field_layout.addWidget(combo)
+            field_layout.addWidget(custom)
+            name_fields.append(field)
         self.dual_image_name_b.setCurrentIndex(1)
-        f.addRow("Image A Name", self.dual_image_name_a)
+        f.addRow("Image A Name", name_fields[0])
         f.addRow("RAW / Image A", self.raw_quality_file_a)
-        f.addRow("Image B Name", self.dual_image_name_b)
+        f.addRow("Image B Name", name_fields[1])
         f.addRow("RAW / Image B", self.raw_quality_file_b)
+        f.addRow(self.dual_compare_controls)
         (
             self.raw_quality_score_group,
             self.raw_quality_score_labels,
@@ -7417,6 +7560,8 @@ class ThermalRawToolkit(QMainWindow):
         f.addRow(self.raw_quality_score_group)
         self.dual_image_name_a.currentIndexChanged.connect(self.dual_image_name_changed)
         self.dual_image_name_b.currentIndexChanged.connect(self.dual_image_name_changed)
+        self.dual_image_custom_name_a.textChanged.connect(self.dual_image_name_changed)
+        self.dual_image_custom_name_b.textChanged.connect(self.dual_image_name_changed)
         self.dual_image_name_changed()
         self.stack.addWidget(p)
         self.raw_quality_file_a.path_selected.connect(
@@ -7814,6 +7959,31 @@ class ThermalRawToolkit(QMainWindow):
         f.addRow(self.raw_input_mapping_note)
         f.addRow(self.raw_pipeline_editor)
         f.addRow("Right Preview", self.raw_preview_stage_combo)
+        self.algorithm_compare_mode = FocusWheelComboBox()
+        self.algorithm_compare_mode.addItems(["Side by Side", "Swipe Compare"])
+        f.addRow("Comparison View", self.algorithm_compare_mode)
+        self.algorithm_name_fields = []
+        for label in ("Image A Name", "Image B Name"):
+            combo = FocusWheelComboBox()
+            combo.addItem("Automatic", "auto")
+            for name, tag in DUAL_UVC_IMAGE_NAME_OPTIONS:
+                combo.addItem(name, tag)
+            combo.addItem("Custom...", "custom")
+            custom = QLineEdit()
+            custom.setMaxLength(80)
+            custom.setPlaceholderText("Enter a name (blank uses automatic name)")
+            custom.hide()
+            field = QWidget()
+            layout = QVBoxLayout(field)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(combo)
+            layout.addWidget(custom)
+            f.addRow(label, field)
+            self.algorithm_name_fields.append((combo, custom))
+            combo.currentIndexChanged.connect(self.algorithm_image_name_changed)
+            custom.textChanged.connect(self.algorithm_image_name_changed)
+        self.algorithm_compare_mode.currentIndexChanged.connect(self.update_dual_compare_mode)
+
         (
             self.raw_algorithm_quality_group,
             self.raw_algorithm_quality_labels,
@@ -8166,7 +8336,7 @@ class ThermalRawToolkit(QMainWindow):
         )
         self.current_result = preview
         if self.current_function_index() == len(self.FUNCTIONS) - 2:
-            title = self.raw_preview_stage_combo.currentText()
+            title = self.algorithm_image_names()[1]
             self.preview_result.set_title(title)
             self.preview_result_caption.setText(title)
             self.preview_result.set_array(preview)
@@ -8242,6 +8412,13 @@ class ThermalRawToolkit(QMainWindow):
         window = self.image_preview_windows.get(key)
         if window is None:
             window = UvcVideoWindow(self)
+            if key in ("dual_image", "image_algorithm"):
+                window.swipe_preview = SwipeCompareWidget()
+                window.layout().addWidget(window.swipe_preview)
+                window.swipe_preview.hide()
+                window.swipe_preview.position_changed.connect(
+                    lambda position, key=key: self.sync_dual_swipe_position(position, key)
+                )
             self.image_preview_windows[key] = window
         window.show()
         self.update_image_preview_window(preview)
@@ -8257,7 +8434,7 @@ class ThermalRawToolkit(QMainWindow):
             titles = (None, f"{kind} Preview (Fixed Scale)")
         elif name == "Image Algorithm Compare":
             kind = source_label(getattr(self, "raw_algorithm_info", {}))
-            titles = (f"Original {kind} (Fixed Scale)", None)
+            titles = self.algorithm_image_names()
         elif name == "Dual Image Compare":
             names = self.dual_image_names()
             infos = getattr(self, "dual_image_source_infos", ({}, {}))
@@ -8273,9 +8450,21 @@ class ThermalRawToolkit(QMainWindow):
                 caption.setText(title)
 
     def dual_image_names(self):
-        return self.dual_image_name_a.currentText(), self.dual_image_name_b.currentText()
+        return tuple(
+            (custom.text().strip() or fallback)
+            if combo.currentData() == "custom" else combo.currentText()
+            for combo, custom, fallback in (
+                (self.dual_image_name_a, self.dual_image_custom_name_a, "Image A"),
+                (self.dual_image_name_b, self.dual_image_custom_name_b, "Image B"),
+            )
+        )
 
     def dual_image_name_changed(self, _index=None):
+        for combo, custom in (
+            (self.dual_image_name_a, self.dual_image_custom_name_a),
+            (self.dual_image_name_b, self.dual_image_custom_name_b),
+        ):
+            custom.setVisible(combo.currentData() == "custom")
         names = self.dual_image_names()
         for label, name in zip(self.raw_quality_score_group.comparison_header_labels, names):
             label.setText(name)
@@ -8288,6 +8477,68 @@ class ThermalRawToolkit(QMainWindow):
                 caption.setText(name)
             self.update_image_preview_titles()
             self.update_image_preview_window(self.preview_original)
+
+    def algorithm_image_names(self):
+        kind = "RAW" if getattr(self, "raw_algorithm_info", {}).get("source_type") == "raw" else "Image"
+        defaults = (f"Original {kind} (Fixed Scale)",
+                    self.raw_preview_stage_combo.currentText() or "Final Pipeline")
+        return tuple(
+            (custom.text().strip() or default) if combo.currentData() == "custom"
+            else default if combo.currentData() == "auto" else combo.currentText()
+            for (combo, custom), default in zip(self.algorithm_name_fields, defaults)
+        )
+
+    def algorithm_image_name_changed(self, _value=None):
+        for combo, custom in self.algorithm_name_fields:
+            custom.setVisible(combo.currentData() == "custom")
+        if self.FUNCTIONS[self.current_function_index()] == "Image Algorithm Compare":
+            self.update_image_preview_titles()
+            self.update_image_preview_window(self.preview_original)
+
+    def image_comparison_key(self):
+        return "image_algorithm" if self.FUNCTIONS[self.current_function_index()] == "Image Algorithm Compare" else "dual_image"
+
+    def image_comparison_mode(self):
+        return self.algorithm_compare_mode if self.image_comparison_key() == "image_algorithm" else self.dual_compare_mode
+
+    def sync_dual_swipe_position(self, position, key=None):
+        key = key or self.image_comparison_key()
+        if not hasattr(self, "image_swipe_positions"):
+            self.image_swipe_positions = {}
+        self.image_swipe_positions[key] = position
+        if key == self.image_comparison_key():
+            self.dual_swipe_preview.set_position(position)
+        window = self.image_preview_windows.get(key)
+        if window is not None:
+            window.swipe_preview.set_position(position)
+
+    def update_dual_compare_mode(self, _index=None):
+        name = self.FUNCTIONS[self.current_function_index()]
+        is_comparison = name in ("Dual Image Compare", "Image Algorithm Compare")
+        swipe = is_comparison and self.image_comparison_mode().currentIndex() == 1
+        self.dual_compare_controls.setVisible(name == "Dual Image Compare")
+        self.dual_swipe_preview.setVisible(swipe)
+        self.dual_swipe_preview.set_position(
+            getattr(self, "image_swipe_positions", {}).get(self.image_comparison_key(), 0.5)
+        )
+        show_original = self.PREVIEW_LAYOUTS[self.current_function_index()][0]
+        self.preview_original_container.setVisible(show_original and not swipe)
+        self.preview_result_container.setVisible(not swipe)
+        if is_comparison:
+            self.update_image_preview_window(self.preview_original)
+
+    def save_dual_swipe_preview(self, path):
+        # Render at source canvas resolution, independent of preview window size.
+        export = SwipeCompareWidget()
+        export.setMinimumSize(1, 1)
+        export.resize(max(frame.width() for frame in self.dual_swipe_preview.frames),
+                      max(frame.height() for frame in self.dual_swipe_preview.frames))
+        export.set_frames(self.dual_swipe_preview.frames, self.dual_swipe_preview.names)
+        export.set_position(self.dual_swipe_preview.position)
+        pixmap = QPixmap(export.size())
+        export.render(pixmap)
+        if not pixmap.save(str(path), "PNG"):
+            raise OSError(f"Could not save comparison: {path}")
 
     def compose_dual_image_preview(self, frames, names=None):
         panel_height = max(frame.shape[0] for frame in frames)
@@ -8311,10 +8562,23 @@ class ThermalRawToolkit(QMainWindow):
         function_name = self.FUNCTIONS[self.current_function_index()]
         is_dual = function_name == "Dual Image Compare"
         is_algorithm = function_name == "Image Algorithm Compare"
+        if is_dual or is_algorithm:
+            pixmaps = (self.preview_original._pixmap, self.preview_result._pixmap)
+            names = (self.preview_original.title, self.preview_result.title)
+            self.dual_swipe_preview.set_frames(pixmaps, names)
         key = "image_algorithm" if is_algorithm else "dual_image" if is_dual else preview
         window = self.image_preview_windows.get(key)
         if window is None or not window.isVisible():
             return
+        if is_dual or is_algorithm:
+            swipe = self.image_comparison_mode().currentIndex() == 1
+            window.image_label.setVisible(not swipe)
+            window.swipe_preview.setVisible(swipe)
+            window.swipe_preview.set_frames(pixmaps, names)
+            window.swipe_preview.set_position(self.dual_swipe_preview.position)
+            window.setWindowTitle(function_name)
+            if swipe:
+                return
         if is_dual or is_algorithm:
             frames = []
             for panel in (self.preview_original, self.preview_result):
@@ -8595,6 +8859,7 @@ class ThermalRawToolkit(QMainWindow):
         self.update_image_preview_titles()
         self.preview_original.set_array(None)
         self.preview_result.set_array(None)
+        self.update_dual_compare_mode()
         action_labels = {
             "Single Image Statistics": "Save Analysis Results",
             "Average RAW Folder": "Average and Save",
@@ -8953,8 +9218,11 @@ class ThermalRawToolkit(QMainWindow):
             outputs["raw_csv_b"] = "raw_b_dn.csv"
             save_csv_matrix(out / outputs["raw_csv_b"], raw_b, "%d")
             self.log.append(f"Saved RAW B DN CSV: {out / outputs['raw_csv_b']}")
-        comparison = self.compose_dual_image_preview([display_a, display_b])
-        save_rgb_png(out / outputs["comparison"], cv2.cvtColor(comparison, cv2.COLOR_BGR2RGB))
+        if self.dual_compare_mode.currentIndex() == 1:
+            self.save_dual_swipe_preview(out / outputs["comparison"])
+        else:
+            comparison = self.compose_dual_image_preview([display_a, display_b])
+            save_rgb_png(out / outputs["comparison"], cv2.cvtColor(comparison, cv2.COLOR_BGR2RGB))
         self.log.append(f"Saved comparison preview: {out / outputs['comparison']}")
         save_png(out / outputs["base_a"], result_a["base_u8"])
         save_png(out / outputs["base_b"], result_b["base_u8"])
@@ -8963,6 +9231,8 @@ class ThermalRawToolkit(QMainWindow):
         manifest = {
             "format_version": 1,
             "mode": "raw_quality_compare",
+            "comparison_view": self.dual_compare_mode.currentText(),
+            "swipe_position": self.dual_swipe_preview.position,
             "analyzed_at": datetime.now().astimezone().isoformat(
                 timespec="seconds"
             ),
@@ -9497,9 +9767,34 @@ class ThermalRawToolkit(QMainWindow):
                 )
             )
         save_pipeline_overview_png(overview_path, overview_items)
+        self.raw_algorithm_source = raw
+        self.raw_pipeline_input = pipeline_input
+        self.raw_pipeline_input_max = input_max
+        self.raw_pipeline_final = processed
+        self.raw_pipeline_records = records
+        self.current_original = raw8
+        self.update_image_preview_titles()
+        self.preview_original.set_array(raw8)
+        self.update_raw_stage_preview()
+        comparison_path = out / "image_comparison.png"
+        if self.algorithm_compare_mode.currentIndex() == 1:
+            self.save_dual_swipe_preview(comparison_path)
+        else:
+            comparison = self.compose_dual_image_preview(
+                [raw8, self.current_result], self.algorithm_image_names()
+            )
+            save_rgb_png(comparison_path, cv2.cvtColor(comparison, cv2.COLOR_BGR2RGB))
+        self.log.append(f"Saved comparison preview: {comparison_path}")
+
         manifest = {
             "format_version": 2,
             "mode": "raw_algorithm_compare",
+            "comparison_view": self.algorithm_compare_mode.currentText(),
+            "swipe_position": self.dual_swipe_preview.position,
+            "comparison_output": comparison_path.name,
+            "comparison_image_names": list(self.algorithm_image_names()),
+            "comparison_stage": self.raw_preview_stage_combo.currentText(),
+            "comparison_stage_index": self.raw_preview_stage_combo.currentData(),
             "source": str(Path(self.raw_algorithm_file.text()).resolve()),
             "resolution": {"width": raw.shape[1], "height": raw.shape[0]},
             "source_info": self.raw_algorithm_info,
@@ -9576,14 +9871,6 @@ class ThermalRawToolkit(QMainWindow):
             ],
         )
 
-        self.raw_algorithm_source = raw
-        self.raw_pipeline_input = pipeline_input
-        self.raw_pipeline_input_max = input_max
-        self.raw_pipeline_final = processed
-        self.raw_pipeline_records = records
-        self.current_original = raw8
-        self.preview_original.set_array(raw8)
-        self.update_raw_stage_preview()
         self.log.append(f"Input Mapping: {mapping_details}")
         self.log.append(f"Pipeline: {self.raw_pipeline_editor.summary()}")
         for record in records:
@@ -12876,6 +13163,11 @@ class ThermalRawToolkit(QMainWindow):
 
         out = self.make_output("manual_preview")
         path = out / "preview.png"
+        if (self.FUNCTIONS[function_index] in ("Dual Image Compare", "Image Algorithm Compare")
+                and self.image_comparison_mode().currentIndex() == 1):
+            self.save_dual_swipe_preview(path)
+            self.log.append(f"Saved swipe comparison preview: {path}")
+            return
         is_bpr_marking = (
             self.FUNCTIONS[function_index] == "BPR Bad Pixel Marking"
         )

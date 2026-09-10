@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='Thermal_RAW_Toolkit_v1.3.0',
+    name='Thermal_RAW_Toolkit_v1.4.0',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

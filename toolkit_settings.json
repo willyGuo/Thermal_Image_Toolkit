@@ -6,7 +6,7 @@
       512
     ],
     "bit_depth": 14,
-    "output_root": "D:\\01_Project\\02_Loewe\\03_Novatek\\04_Develop\\03_VM\\ShareFolder\\Tiffany_thermal\\Thermal_RAW_Toolkit\\Thermal_RAW_Results"
+    "output_root": "D:\\01_Project\\02_Loewe\\08_Tool\\Thermal_Image_Toolkit\\Thermal_RAW_Results"
   },
   "timeline": {
     "metric": "flicker_control_score",
