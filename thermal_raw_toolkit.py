@@ -44,7 +44,7 @@ except (ImportError, OSError):
     QCameraInfo = None
 
 
-APP_VERSION = "v1.4.0"
+APP_VERSION = "v1.4.1"
 APP_TITLE = f"Thermal RAW Toolkit {APP_VERSION}"
 
 
@@ -320,7 +320,7 @@ IMAGE_ALGORITHM_OPTIONS = [
     ("Gamma", "gamma"),
     ("Bilateral Denoise", "bilateral"),
     ("Unsharp Mask", "unsharp"),
-    ("DDE Multi-scale Detail Enhancement", "dde"),
+    ("DDE Domain Transform Detail Enhancement", "dde"),
     ("Auto Contrast + CLAHE", "auto_contrast_clahe"),
     ("P1/P99 Percentile Preview (Original Values)", "raw_percentile_preview"),
 ]
@@ -330,14 +330,33 @@ PIPELINE_ALGORITHM_OPTIONS = [
     ("Histogram Equalization", "hist_equalization"),
     ("CLAHE", "clahe"),
     ("Gamma", "gamma"),
+    ("Median Filter", "median"),
+    ("Gaussian Filter", "gaussian"),
     ("Bilateral Denoise", "bilateral"),
     ("Unsharp Mask", "unsharp"),
-    ("DDE Multi-scale Detail Enhancement", "dde"),
+    ("DDE Domain Transform Detail Enhancement", "dde"),
 ]
-RAW_INPUT_MAPPING_OPTIONS = [
-    ("Fixed Bit Depth Scale", "fixed_scale"),
-    ("P1/P99 from Original RAW DN", "raw_percentile_preview"),
+TONE_MAPPING_OPTIONS = [
+    ("Linear Full Range", "linear"),
+    ("Percentile", "percentile"),
+    ("Global Histogram Equalization", "hist_equalization"),
+    ("CLAHE Tone Mapping", "clahe"),
+    ("Fieldscale Local Adaptive AGC", "fieldscale"),
 ]
+DEFAULT_TONE_MAPPING_PARAMETERS = {
+    "linear": {"black_dn": 0, "white_dn": 16383},
+    "percentile": {"low_percentile": 1.0, "high_percentile": 99.0},
+    "hist_equalization": {"exclude_zero": False},
+    "clahe": {"clahe_clip": 2.0, "clahe_grid": 8},
+    "fieldscale": {
+        "grid_count": 8,
+        "les_distance": 2,
+        "les_threshold_raw14": 400,
+        "message_passing_distance": 1,
+        "message_passing_iterations": 7,
+        "max_local_gain": 0.0,
+    },
+}
 IMAGE_ALGORITHM_DESCRIPTIONS = {
     "auto_contrast": (
         "在 8-bit 工作影像上計算 P1/P99，將 P1 映射為黑色、P99 映射為白色，"
@@ -360,6 +379,14 @@ IMAGE_ALGORITHM_DESCRIPTIONS = {
         "以 Gamma 曲線重新映射 8-bit 灰階；目前公式中 Gamma 小於 1 會提亮中間灰階，"
         "大於 1 會壓暗。"
     ),
+    "median": (
+        "Median filtering replaces each 8-bit pixel with the neighborhood median. "
+        "It is especially useful for isolated hot/cold impulse noise while preserving edges."
+    ),
+    "gaussian": (
+        "Gaussian filtering smooths the 8-bit image with a weighted neighborhood. "
+        "Kernel Size controls the area and Sigma controls the blur strength."
+    ),
     "bilateral": (
         "在 8-bit 影像上做保邊雙邊濾波，降低雜訊並盡量保留物體邊緣。"
     ),
@@ -367,8 +394,10 @@ IMAGE_ALGORITHM_DESCRIPTIONS = {
         "以原圖減去模糊影像取得高頻細節，再依 Amount 加回原圖以增強邊緣。"
     ),
     "dde": (
-        "四層 Gaussian Pyramid 多尺度細節增強：Beta 控制基礎影像保留量，"
-        "Alpha 放大正向細節，Sigma 控制 NLM 降噪強度，最後執行 P2/P98 對比拉伸。"
+        "Y8 Domain Transform filtering from Tiffany_thermal/Enhancement/DDE. "
+        "Output = base + gain * (original - base), clipped to 0..255. "
+        "Sigma S controls spatial smoothing; Sigma R controls edge sensitivity. "
+        "Gain 100% preserves the input; Standard/Fast use 3/1 iterations."
     ),
     "auto_contrast_clahe": (
         "先在 8-bit 工作影像做 P1/P99 Auto Contrast，再執行 CLAHE 局部對比增強。"
@@ -388,13 +417,16 @@ DEFAULT_ALGORITHM_PARAMETERS = {
         "les_threshold_raw14": 400,
         "message_passing_distance": 1,
         "message_passing_iterations": 7,
+        "max_local_gain": 0.0,
     },
     "hist_equalization": {},
     "clahe": {"clahe_clip": 2.0, "clahe_grid": 8},
     "gamma": {"gamma": 0.7},
+    "median": {"median_kernel_size": 3},
+    "gaussian": {"gaussian_kernel_size": 5, "gaussian_sigma": 1.0},
     "bilateral": {"bilateral_strength": 2},
     "unsharp": {"unsharp_amount": 1.0},
-    "dde": {"dde_sigma": 1.0, "dde_alpha": 1.5, "dde_beta": 0.5},
+    "dde": {"dde_sigma_s": 8, "dde_sigma_r": 16, "dde_gain_percent": 150, "dde_num_iters": 3},
 }
 
 
@@ -420,6 +452,10 @@ class AlgorithmStage:
     def __post_init__(self):
         defaults = default_algorithm_parameters(self.algorithm_key)
         defaults.update(self.parameters)
+        if self.algorithm_key == "dde":
+            # Gaussian-pyramid parameters have no Domain Transform equivalent.
+            for legacy_key in ("dde_sigma", "dde_alpha", "dde_beta"):
+                defaults.pop(legacy_key, None)
         self.parameters = defaults
 
     def clone(self):
@@ -559,72 +595,59 @@ def percentile_preview_u8(image, p_low=1.0, p_high=99.0):
     return np.clip(stretched, 0, 255).astype(np.uint8), vmin, vmax
 
 
-def dde_multiscale_u8(image, sigma=1.0, alpha=1.5, beta=0.5, levels=4):
-    """Executable OpenCV/NumPy form of the supplied multi-scale DDE reference."""
-    if image.ndim != 2:
-        raise ValueError("DDE input must be a 2D grayscale image.")
-    minimum_size = 1 << (levels - 1)
-    if min(image.shape) < minimum_size:
-        raise ValueError(
-            f"DDE requires image width and height >= {minimum_size}."
-        )
+def dde_domain_transform_u8(image, sigma_s=8, sigma_r=16,
+                            gain_percent=150, num_iters=3):
+    """Port of DDE_DT_Optimized (Y8, DDE_USING_MAPPING=0).
 
-    sigma = max(0.0, float(sigma))
-    alpha = max(0.0, float(alpha))
-    beta = max(0.0, float(beta))
-    source_u8 = np.ascontiguousarray(
-        np.clip(image, 0, 255).astype(np.uint8)
-    )
-    source = source_u8.astype(np.float32) / 255.0
-    pyramid = [source]
-    for _ in range(1, levels):
-        pyramid.append(cv2.pyrDown(pyramid[-1]))
-
-    # The supplied sample creates a base value but never adds it to its output and
-    # never uses beta. Here beta is the retained source/base contribution.
-    enhanced = beta * source
-    source_size = (source.shape[1], source.shape[0])
-    for level in range(1, levels):
-        previous = pyramid[level - 1]
-        expanded = cv2.resize(
-            pyramid[level],
-            (previous.shape[1], previous.shape[0]),
-            interpolation=cv2.INTER_LINEAR,
-        )
-        detail = np.clip((previous - expanded) * alpha, 0.0, 1.0)
-        if detail.shape != source.shape:
-            detail = cv2.resize(
-                detail, source_size, interpolation=cv2.INTER_LINEAR
-            )
-        enhanced += detail
-
-    enhanced_u8 = np.rint(
-        np.clip(enhanced, 0.0, 1.0) * 255.0
-    ).astype(np.uint8)
-    if sigma > 0.0:
-        denoised = cv2.fastNlMeansDenoising(
-            enhanced_u8,
-            None,
-            h=10.0 * sigma,
-            templateWindowSize=7,
-            searchWindowSize=21,
-        )
-    else:
-        denoised = enhanced_u8
-
-    p2, p98 = np.percentile(denoised, (2.0, 98.0))
-    if p98 <= p2:
-        output = denoised.copy()
-    else:
-        output = np.clip(
-            (denoised.astype(np.float32) - p2) * 255.0 / (p98 - p2),
-            0.0,
-            255.0,
-        ).astype(np.uint8)
+    Original Y8 differences guide every iteration. Each axis averages independent
+    forward/backward recursive passes, matching the firmware's float32 order.
+    """
+    if image.ndim != 2 or not all(0 < size <= 4096 for size in image.shape):
+        raise ValueError("DDE requires a nonempty 2D image up to 4096x4096.")
+    values = (sigma_s, sigma_r, gain_percent, num_iters)
+    limits = ((1, 256), (1, 255), (0, 1000), (1, 8))
+    if any(not np.isfinite(v) or int(v) != v or not lo <= v <= hi
+           for v, (lo, hi) in zip(values, limits)):
+        raise ValueError("DDE requires integer Sigma S 1..256, Sigma R 1..255, "
+                         "Gain 0..1000%, and Iterations 1..8.")
+    num_iters = int(num_iters)
+    source = np.ascontiguousarray(np.clip(image, 0, 255), dtype=np.uint8)
+    original = source.astype(np.float32)
+    base = original.copy()
+    differences = [np.abs(np.diff(source.astype(np.int16), axis=axis))
+                   for axis in (1, 0)]
+    d = np.arange(256, dtype=np.float32)
+    denom = np.sqrt(np.float32(4 ** num_iters - 1))
+    for iteration in range(num_iters):
+        ss = (np.float32(sigma_s) * np.sqrt(np.float32(3))
+              * np.float32(2 ** (num_iters - iteration - 1)) / denom)
+        ratio = ss / np.float32(sigma_r)
+        factor = ratio * ratio
+        coefficient = np.float32(np.sqrt(2.0) / float(ss))
+        lut = np.exp(-coefficient * np.sqrt(np.float32(1) + factor * d * d))
+        for axis, diff in zip((1, 0), differences):
+            # Move the recursive axis first and process all independent lines together.
+            src = np.moveaxis(base, axis, 0)
+            weights = np.moveaxis(lut[diff], axis, 0)
+            dst = np.empty_like(src)
+            dst[0] = src[0]
+            for i in range(1, len(src)):
+                a = weights[i - 1]
+                dst[i] = (np.float32(1) - a) * src[i] + a * dst[i - 1]
+            backward = src[-1].copy()
+            dst[-1] = (dst[-1] + backward) * np.float32(0.5)
+            for i in range(len(src) - 2, -1, -1):
+                a = weights[i]
+                backward = (np.float32(1) - a) * src[i] + a * backward
+                dst[i] = (dst[i] + backward) * np.float32(0.5)
+            base = np.moveaxis(dst, 0, axis)
+    gain = np.float32(gain_percent) / np.float32(100)
+    enhanced = base + (original - base) * gain
+    output = (np.clip(enhanced, 0, 255) + np.float32(0.5)).astype(np.uint8)
     return output, [
-        f"DDE Gaussian pyramid levels={levels}",
-        f"Sigma={sigma:.2f}, Alpha={alpha:.2f}, Beta={beta:.2f}",
-        f"NLM h={10.0 * sigma:.2f}; contrast P2={p2:.2f}, P98={p98:.2f}",
+        "DDE Domain Transform Y8; percentile mapping disabled",
+        f"Sigma S={sigma_s}, Sigma R={sigma_r}, Gain={gain_percent}%, "
+        f"Iterations={num_iters}",
     ]
 
 
@@ -731,6 +754,7 @@ def fieldscale_firmware_preview_u8(
     message_passing_distance=1,
     message_passing_iterations=7,
     temporal_smoothing_percent=90,
+    max_local_gain=0.0,
 ):
     if image.ndim != 2:
         raise ValueError("Fieldscale input must be a 2D grayscale image.")
@@ -771,6 +795,7 @@ def fieldscale_firmware_preview_u8(
     temporal_smoothing_percent = max(
         0, min(99, int(temporal_smoothing_percent))
     )
+    max_local_gain = max(0.0, float(max_local_gain))
     threshold_q8 = max(
         0,
         int(round(
@@ -821,6 +846,24 @@ def fieldscale_firmware_preview_u8(
         state["max_grid"] = max_grid.copy()
         state["input_max"] = input_max
 
+    gain_limit_applied = max_local_gain >= 1.0
+    minimum_range_levels = 0.0
+    if gain_limit_applied:
+        full_range_q8 = int(input_max) * FIELDSCALE_Q8_ONE
+        minimum_range_q8 = min(
+            full_range_q8,
+            int(np.ceil(full_range_q8 / max_local_gain)),
+        )
+        low_grid = np.minimum(min_grid, max_grid)
+        high_grid = np.maximum(min_grid, max_grid)
+        span_grid = np.maximum(high_grid - low_grid, minimum_range_q8)
+        adjusted_low = (low_grid + high_grid - span_grid) // 2
+        adjusted_low = np.maximum(adjusted_low, 0)
+        adjusted_low = np.minimum(adjusted_low, full_range_q8 - span_grid)
+        min_grid = adjusted_low
+        max_grid = adjusted_low + span_grid
+        minimum_range_levels = minimum_range_q8 / FIELDSCALE_Q8_ONE
+
     min_field = _fieldscale_resize_q8(min_grid, width, height)
     max_field = _fieldscale_resize_q8(max_grid, width, height)
     low = np.minimum(min_field, max_field)
@@ -842,6 +885,12 @@ def fieldscale_firmware_preview_u8(
         f"({threshold_levels:.2f} input levels)",
         f"message passing distance={message_passing_distance}, "
         f"iterations={message_passing_iterations}",
+        (
+            f"max local gain={max_local_gain:.1f}x; "
+            f"minimum local range={minimum_range_levels:.1f} input levels"
+            if gain_limit_applied
+            else "max local gain=off (reference behavior)"
+        ),
         "Gamma=off, CLAHE=off",
     ]
     if temporal:
@@ -854,6 +903,207 @@ def fieldscale_firmware_preview_u8(
     return preview, details
 
 
+def tone_mapping_parameters(method, parameters=None, input_max=255):
+    if method not in DEFAULT_TONE_MAPPING_PARAMETERS:
+        raise ValueError(f"Unsupported tone mapping method: {method}")
+    result = dict(DEFAULT_TONE_MAPPING_PARAMETERS[method])
+    if method == "linear":
+        result["white_dn"] = int(input_max)
+    if parameters:
+        result.update(parameters)
+    return result
+
+
+def histogram_equalization_native_u8(image, input_max, exclude_zero=False):
+    source = np.clip(image, 0, input_max).astype(np.int64)
+    valid = source != 0 if exclude_zero else np.ones(source.shape, dtype=bool)
+    values = source[valid]
+    if values.size == 0:
+        return np.zeros(source.shape, dtype=np.uint8)
+    histogram = np.bincount(values.reshape(-1), minlength=int(input_max) + 1)
+    cdf = np.cumsum(histogram, dtype=np.int64)
+    populated = np.flatnonzero(histogram)
+    if populated.size <= 1:
+        result = np.zeros(source.shape, dtype=np.uint8)
+    else:
+        cdf_min = int(cdf[populated[0]])
+        denominator = int(values.size) - cdf_min
+        if denominator <= 0:
+            result = np.zeros(source.shape, dtype=np.uint8)
+        else:
+            lut = np.clip(
+                np.rint((cdf - cdf_min) * 255.0 / denominator), 0, 255
+            ).astype(np.uint8)
+            result = lut[source]
+    if exclude_zero:
+        result[~valid] = 0
+    return result
+
+
+def apply_tone_mapping(
+    image,
+    method,
+    input_max,
+    parameters=None,
+    pad_fieldscale_input=False,
+):
+    if cv2 is None:
+        raise RuntimeError("OpenCV not installed. pip install opencv-python")
+    if image.ndim != 2:
+        raise ValueError("Tone mapping input must be a 2D grayscale image.")
+    input_max = max(1, int(input_max))
+    params = tone_mapping_parameters(method, parameters, input_max)
+    calculated = {"input_min": int(np.min(image)), "input_max": int(np.max(image))}
+
+    if method == "linear":
+        black_dn = int(params["black_dn"])
+        white_dn = int(params["white_dn"])
+        if not 0 <= black_dn < white_dn <= input_max:
+            raise ValueError(
+                f"Linear mapping requires 0 <= Black DN < White DN <= {input_max}."
+            )
+        mapped = np.clip(
+            (image.astype(np.float64) - black_dn) * 255.0 / (white_dn - black_dn),
+            0,
+            255,
+        ).astype(np.uint8)
+        calculated.update({"black_dn": black_dn, "white_dn": white_dn})
+        details = f"Linear {black_dn}..{white_dn} DN -> 8-bit"
+    elif method == "percentile":
+        low = float(params["low_percentile"])
+        high = float(params["high_percentile"])
+        if not 0.0 <= low < high <= 100.0:
+            raise ValueError("Percentile mapping requires Low Percentile < High Percentile.")
+        mapped, low_dn, high_dn = percentile_preview_u8(image, low, high)
+        calculated.update({"low_dn": low_dn, "high_dn": high_dn})
+        details = f"P{low:.1f}={low_dn:.1f}, P{high:.1f}={high_dn:.1f} DN -> 8-bit"
+    elif method == "hist_equalization":
+        exclude_zero = bool(params["exclude_zero"])
+        mapped = histogram_equalization_native_u8(image, input_max, exclude_zero)
+        calculated["exclude_zero"] = exclude_zero
+        details = (
+            f"Native-DN global histogram equalization -> 8-bit; "
+            f"zero DN {'excluded' if exclude_zero else 'included'}"
+        )
+    elif method == "clahe":
+        clip_limit = float(params["clahe_clip"])
+        grid_size = int(params["clahe_grid"])
+        source_bits = max(1, min(16, int(input_max).bit_length()))
+        if source_bits <= 8:
+            histogram_bins = 256
+            source_left_shift = 0
+            histogram_bit_shift = 0
+            effective_clip_limit = clip_limit
+            source_for_clahe = raw_to_display_u8(image, input_max)
+        else:
+            source_left_shift = 16 - source_bits
+            histogram_bit_shift = 8
+            histogram_bins = 256
+            source_for_clahe = np.left_shift(
+                np.clip(image, 0, input_max).astype(np.uint16), source_left_shift
+            )
+            effective_clip_limit = clip_limit
+        clahe = cv2.createCLAHE(
+            clipLimit=effective_clip_limit,
+            tileGridSize=(grid_size, grid_size),
+        )
+        bit_shift_supported = hasattr(clahe, "setBitShift")
+        if source_bits > 8 and bit_shift_supported:
+            clahe.setBitShift(histogram_bit_shift)
+        elif source_bits > 8:
+            # Older OpenCV builds lack configurable 16-bit histogram shifting.
+            # Quantize the left-aligned native values to the same 256 bins first.
+            source_for_clahe = np.right_shift(
+                source_for_clahe, histogram_bit_shift
+            ).astype(np.uint8)
+        mapped_native = clahe.apply(source_for_clahe)
+        if mapped_native.dtype == np.uint8:
+            mapped = mapped_native
+        else:
+            mapped = np.right_shift(
+                mapped_native, histogram_bit_shift
+            ).astype(np.uint8)
+        padded_width = (
+            image.shape[1]
+            if image.shape[1] % grid_size == 0
+            else image.shape[1] + grid_size - image.shape[1] % grid_size
+        )
+        padded_height = (
+            image.shape[0]
+            if image.shape[0] % grid_size == 0
+            else image.shape[0] + grid_size - image.shape[0] % grid_size
+        )
+        tile_pixels = (padded_width // grid_size) * (padded_height // grid_size)
+        internal_clip_count = max(
+            int(effective_clip_limit * tile_pixels / histogram_bins), 1
+        )
+        calculated.update(
+            {
+                "source_bits": source_bits,
+                "histogram_bins": histogram_bins,
+                "input_dn_per_histogram_bin": max(
+                    1, ((input_max + 1) + histogram_bins - 1) // histogram_bins
+                ),
+                "source_left_shift": source_left_shift,
+                "opencv_histogram_bit_shift": (
+                    histogram_bit_shift if bit_shift_supported else None
+                ),
+                "ui_clip_limit_8bit_equivalent": clip_limit,
+                "opencv_clip_limit": effective_clip_limit,
+                "internal_clip_count_per_bin": internal_clip_count,
+                "clahe_grid": grid_size,
+            }
+        )
+        details = (
+            f"Native-DN CLAHE {source_bits}-bit, bins={histogram_bins}, "
+            f"{calculated['input_dn_per_histogram_bin']} DN/bin, "
+            f"OpenCV bit shift="
+            f"{calculated['opencv_histogram_bit_shift']}; "
+            f"UI clip={clip_limit:.1f} (8-bit equivalent), "
+            f"OpenCV clip={effective_clip_limit:.1f}, "
+            f"internal clip={internal_clip_count} px/bin, "
+            f"grid={grid_size}x{grid_size} -> 8-bit"
+        )
+    elif method == "fieldscale":
+        source = image
+        original_shape = source.shape
+        padding = (0, 0)
+        grid_count = int(params["grid_count"])
+        if pad_fieldscale_input:
+            padding = ((-source.shape[0]) % grid_count, (-source.shape[1]) % grid_count)
+            if any(padding):
+                source = np.pad(source, ((0, padding[0]), (0, padding[1])), mode="edge")
+        mapped, fieldscale_details = fieldscale_firmware_preview_u8(
+            source,
+            input_max,
+            grid_count=grid_count,
+            les_distance=int(params["les_distance"]),
+            les_threshold_raw14=int(params["les_threshold_raw14"]),
+            message_passing_distance=int(params["message_passing_distance"]),
+            message_passing_iterations=int(params["message_passing_iterations"]),
+            max_local_gain=float(params.get("max_local_gain", 0.0)),
+        )
+        if any(padding):
+            mapped = mapped[:original_shape[0], :original_shape[1]].copy()
+            fieldscale_details.append(
+                f"Image edge padding: bottom={padding[0]}, right={padding[1]}; cropped back"
+            )
+        calculated.update(
+            {
+                "grid_count": grid_count,
+                "les_threshold_percent_raw14": round(
+                    int(params["les_threshold_raw14"]) * 100.0 / FIELDSCALE_RAW14_MAX,
+                    3,
+                ),
+            }
+        )
+        details = " | ".join(fieldscale_details)
+    else:
+        raise ValueError(f"Unsupported tone mapping method: {method}")
+
+    return np.ascontiguousarray(mapped), details, calculated, params
+
+
 def apply_image_algorithm(
     gray,
     algorithm_key,
@@ -862,6 +1112,9 @@ def apply_image_algorithm(
     clahe_clip=2.0,
     clahe_grid=8,
     gamma=0.7,
+    median_kernel_size=3,
+    gaussian_kernel_size=5,
+    gaussian_sigma=1.0,
     bilateral_strength=2,
     unsharp_amount=1.0,
     clahe=None,
@@ -874,9 +1127,11 @@ def apply_image_algorithm(
     message_passing_distance=1,
     message_passing_iterations=7,
     temporal_smoothing_percent=90,
-    dde_sigma=1.0,
-    dde_alpha=1.5,
-    dde_beta=0.5,
+    max_local_gain=0.0,
+    dde_sigma_s=8,
+    dde_sigma_r=16,
+    dde_gain_percent=150,
+    dde_num_iters=3,
 ):
     if cv2 is None:
         raise RuntimeError("OpenCV not installed. pip install opencv-python")
@@ -902,14 +1157,16 @@ def apply_image_algorithm(
             message_passing_distance=message_passing_distance,
             message_passing_iterations=message_passing_iterations,
             temporal_smoothing_percent=temporal_smoothing_percent,
+            max_local_gain=max_local_gain,
         )
 
     if algorithm_key == "dde":
-        return dde_multiscale_u8(
+        return dde_domain_transform_u8(
             gray,
-            sigma=dde_sigma,
-            alpha=dde_alpha,
-            beta=dde_beta,
+            sigma_s=dde_sigma_s,
+            sigma_r=dde_sigma_r,
+            gain_percent=dde_gain_percent,
+            num_iters=dde_num_iters,
         )
 
     processed = np.ascontiguousarray(np.clip(gray, 0, 255).astype(np.uint8))
@@ -946,6 +1203,28 @@ def apply_image_algorithm(
         )
         processed = cv2.LUT(processed, lut)
         details.append(f"Gamma={gamma:.1f}")
+    elif algorithm_key == "median":
+        median_kernel_size = int(median_kernel_size)
+        if median_kernel_size < 3 or median_kernel_size % 2 == 0:
+            raise ValueError("Median Kernel Size must be an odd integer of at least 3.")
+        processed = cv2.medianBlur(processed, median_kernel_size)
+        details.append(f"Median kernel={median_kernel_size}x{median_kernel_size}")
+    elif algorithm_key == "gaussian":
+        gaussian_kernel_size = int(gaussian_kernel_size)
+        gaussian_sigma = float(gaussian_sigma)
+        if gaussian_kernel_size < 3 or gaussian_kernel_size % 2 == 0:
+            raise ValueError("Gaussian Kernel Size must be an odd integer of at least 3.")
+        if gaussian_sigma <= 0.0:
+            raise ValueError("Gaussian Sigma must be greater than 0.")
+        processed = cv2.GaussianBlur(
+            processed,
+            (gaussian_kernel_size, gaussian_kernel_size),
+            gaussian_sigma,
+        )
+        details.append(
+            f"Gaussian kernel={gaussian_kernel_size}x{gaussian_kernel_size}, "
+            f"sigma={gaussian_sigma:.1f}"
+        )
     elif algorithm_key == "bilateral":
         diameter = bilateral_strength * 2 + 1
         sigma = bilateral_strength * 20
@@ -1029,6 +1308,9 @@ def apply_algorithm_pipeline(
             clahe_clip=params.get("clahe_clip", 2.0),
             clahe_grid=params.get("clahe_grid", 8),
             gamma=params.get("gamma", 0.7),
+            median_kernel_size=params.get("median_kernel_size", 3),
+            gaussian_kernel_size=params.get("gaussian_kernel_size", 5),
+            gaussian_sigma=params.get("gaussian_sigma", 1.0),
             bilateral_strength=params.get("bilateral_strength", 2),
             unsharp_amount=params.get("unsharp_amount", 1.0),
             clahe=clahe,
@@ -1049,9 +1331,11 @@ def apply_algorithm_pipeline(
             temporal_smoothing_percent=params.get(
                 "temporal_smoothing_percent", 90
             ),
-            dde_sigma=params.get("dde_sigma", 1.0),
-            dde_alpha=params.get("dde_alpha", 1.5),
-            dde_beta=params.get("dde_beta", 0.5),
+            max_local_gain=params.get("max_local_gain", 0.0),
+            dde_sigma_s=params.get("dde_sigma_s", 8),
+            dde_sigma_r=params.get("dde_sigma_r", 16),
+            dde_gain_percent=params.get("dde_gain_percent", 150),
+            dde_num_iters=params.get("dde_num_iters", 3),
         )
         if any(padding):
             processed = processed[:original_shape[0], :original_shape[1]].copy()
@@ -4525,6 +4809,8 @@ class AlgorithmPipelineEditor(QWidget):
         parent=None,
         allow_step_algorithm_change=True,
         fieldscale_temporal=False,
+        title_text="Algorithm Pipeline (top to bottom)",
+        title_pixel_size=15,
     ):
         super().__init__(parent)
         self._stages = []
@@ -4537,10 +4823,14 @@ class AlgorithmPipelineEditor(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(7)
-        title = QLabel("Algorithm Pipeline (top to bottom)")
+        title = QLabel(title_text)
         title.setWordWrap(True)
         title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        title.setStyleSheet("font-size:15px; font-weight:700; color:#c9e2f2;")
+        title_font = title.font()
+        title_font.setPixelSize(int(title_pixel_size))
+        title_font.setWeight(QFont.Bold)
+        title.setFont(title_font)
+        title.setStyleSheet("color:#c9e2f2;")
         root.addWidget(title)
 
         self.add_algorithm_combo = FocusWheelComboBox()
@@ -4630,36 +4920,42 @@ class AlgorithmPipelineEditor(QWidget):
         self.stage_gamma.setRange(0.1, 3.0)
         self.stage_gamma.setDecimals(1)
         self.stage_gamma.setSingleStep(0.1)
+        self.stage_median_kernel_size = FocusWheelComboBox()
+        self.stage_gaussian_kernel_size = FocusWheelComboBox()
+        for kernel_size in (3, 5, 7, 9, 11, 13, 15):
+            label = f"{kernel_size} x {kernel_size}"
+            self.stage_median_kernel_size.addItem(label, kernel_size)
+            self.stage_gaussian_kernel_size.addItem(label, kernel_size)
+        self.stage_gaussian_kernel_size.setCurrentIndex(
+            self.stage_gaussian_kernel_size.findData(5)
+        )
+        self.stage_gaussian_sigma = FocusWheelDoubleSpinBox()
+        self.stage_gaussian_sigma.setRange(0.1, 10.0)
+        self.stage_gaussian_sigma.setDecimals(1)
+        self.stage_gaussian_sigma.setSingleStep(0.1)
+        self.stage_gaussian_sigma.setValue(1.0)
         self.stage_bilateral_strength = FocusWheelSpinBox()
         self.stage_bilateral_strength.setRange(1, 7)
         self.stage_unsharp_amount = FocusWheelDoubleSpinBox()
         self.stage_unsharp_amount.setRange(0.1, 3.0)
         self.stage_unsharp_amount.setDecimals(1)
         self.stage_unsharp_amount.setSingleStep(0.1)
-        self.stage_dde_sigma = FocusWheelDoubleSpinBox()
-        self.stage_dde_sigma.setRange(0.0, 5.0)
-        self.stage_dde_sigma.setDecimals(1)
-        self.stage_dde_sigma.setSingleStep(0.1)
-        self.stage_dde_sigma.setValue(1.0)
-        self.stage_dde_sigma.setToolTip(
-            "Noise-reduction strength; OpenCV NLM uses h = 10 x Sigma."
-        )
-        self.stage_dde_alpha = FocusWheelDoubleSpinBox()
-        self.stage_dde_alpha.setRange(0.0, 5.0)
-        self.stage_dde_alpha.setDecimals(1)
-        self.stage_dde_alpha.setSingleStep(0.1)
-        self.stage_dde_alpha.setValue(1.5)
-        self.stage_dde_alpha.setToolTip(
-            "Gain applied to positive multi-scale detail layers."
-        )
-        self.stage_dde_beta = FocusWheelDoubleSpinBox()
-        self.stage_dde_beta.setRange(0.0, 2.0)
-        self.stage_dde_beta.setDecimals(1)
-        self.stage_dde_beta.setSingleStep(0.1)
-        self.stage_dde_beta.setValue(0.5)
-        self.stage_dde_beta.setToolTip(
-            "Amount of the source/base image retained before detail enhancement."
-        )
+        self.stage_dde_sigma_s = FocusWheelSpinBox()
+        self.stage_dde_sigma_s.setRange(1, 256)
+        self.stage_dde_sigma_s.setValue(8)
+        self.stage_dde_sigma_s.setToolTip("Spatial smoothing radius in pixels.")
+        self.stage_dde_sigma_r = FocusWheelSpinBox()
+        self.stage_dde_sigma_r.setRange(1, 255)
+        self.stage_dde_sigma_r.setValue(16)
+        self.stage_dde_sigma_r.setToolTip("Edge sensitivity in Y8 DN.")
+        self.stage_dde_gain_percent = FocusWheelSpinBox()
+        self.stage_dde_gain_percent.setRange(0, 1000)
+        self.stage_dde_gain_percent.setValue(150)
+        self.stage_dde_gain_percent.setToolTip("Detail gain: 100% preserves input; 0% outputs the base.")
+        self.stage_dde_num_iters = FocusWheelSpinBox()
+        self.stage_dde_num_iters.setRange(1, 8)
+        self.stage_dde_num_iters.setValue(3)
+        self.stage_dde_num_iters.setToolTip("Standard: 3 iterations; Fast: 1 iteration.")
         self.stage_fieldscale_grid_count = FocusWheelComboBox()
         for grid_count in (2, 4, 8, 16, 32):
             self.stage_fieldscale_grid_count.addItem(
@@ -4696,6 +4992,14 @@ class AlgorithmPipelineEditor(QWidget):
         self.stage_fieldscale_message_iterations.setToolTip(
             "Number of message-passing iterations; 0 disables message passing."
         )
+        self.stage_fieldscale_max_local_gain = FocusWheelComboBox()
+        self.stage_fieldscale_max_local_gain.addItem("Off (Reference)", 0.0)
+        for gain in (1, 2, 4, 8, 16, 32):
+            self.stage_fieldscale_max_local_gain.addItem(f"{gain} x", float(gain))
+        self.stage_fieldscale_max_local_gain.setToolTip(
+            "Limits noise amplification by enforcing local range >= full input "
+            "range / selected gain. Off preserves the reference algorithm."
+        )
         self.stage_fieldscale_temporal_smoothing = FocusWheelSpinBox()
         self.stage_fieldscale_temporal_smoothing.setRange(0, 99)
         self.stage_fieldscale_temporal_smoothing.setValue(90)
@@ -4723,6 +5027,9 @@ class AlgorithmPipelineEditor(QWidget):
             self.stage_fieldscale_message_iterations,
         )
         self._add_parameter_row(
+            "Max Local Gain", self.stage_fieldscale_max_local_gain
+        )
+        self._add_parameter_row(
             "Temporal Smoothing",
             self.stage_fieldscale_temporal_smoothing,
         )
@@ -4731,9 +5038,13 @@ class AlgorithmPipelineEditor(QWidget):
         self._add_parameter_row("CLAHE Clip Limit", self.stage_clahe_clip)
         self._add_parameter_row("CLAHE Grid Size", self.stage_clahe_grid)
         self._add_parameter_row("Gamma", self.stage_gamma)
-        self._add_parameter_row("Sigma", self.stage_dde_sigma)
-        self._add_parameter_row("Alpha", self.stage_dde_alpha)
-        self._add_parameter_row("Beta", self.stage_dde_beta)
+        self._add_parameter_row("Median Kernel Size", self.stage_median_kernel_size)
+        self._add_parameter_row("Gaussian Kernel Size", self.stage_gaussian_kernel_size)
+        self._add_parameter_row("Gaussian Sigma", self.stage_gaussian_sigma)
+        self._add_parameter_row("Sigma S", self.stage_dde_sigma_s)
+        self._add_parameter_row("Sigma R", self.stage_dde_sigma_r)
+        self._add_parameter_row("Gain (%)", self.stage_dde_gain_percent)
+        self._add_parameter_row("Iterations", self.stage_dde_num_iters)
         self._add_parameter_row(
             "Bilateral Strength", self.stage_bilateral_strength
         )
@@ -4761,11 +5072,13 @@ class AlgorithmPipelineEditor(QWidget):
             self.stage_clahe_clip,
             self.stage_clahe_grid,
             self.stage_gamma,
+            self.stage_gaussian_sigma,
             self.stage_bilateral_strength,
             self.stage_unsharp_amount,
-            self.stage_dde_sigma,
-            self.stage_dde_alpha,
-            self.stage_dde_beta,
+            self.stage_dde_sigma_s,
+            self.stage_dde_sigma_r,
+            self.stage_dde_gain_percent,
+            self.stage_dde_num_iters,
             self.stage_fieldscale_les_distance,
             self.stage_fieldscale_les_threshold,
             self.stage_fieldscale_message_distance,
@@ -4775,6 +5088,15 @@ class AlgorithmPipelineEditor(QWidget):
             widget.valueChanged.connect(self.selected_parameter_changed)
         self.stage_fieldscale_grid_count.currentIndexChanged.connect(
             self.selected_fieldscale_grid_changed
+        )
+        self.stage_median_kernel_size.currentIndexChanged.connect(
+            self.selected_parameter_changed
+        )
+        self.stage_gaussian_kernel_size.currentIndexChanged.connect(
+            self.selected_parameter_changed
+        )
+        self.stage_fieldscale_max_local_gain.currentIndexChanged.connect(
+            self.selected_parameter_changed
         )
         self.set_stages([])
 
@@ -4834,6 +5156,12 @@ class AlgorithmPipelineEditor(QWidget):
                 f"MP d={params.get('message_passing_distance', 1)}, "
                 f"N={params.get('message_passing_iterations', 7)}"
             )
+            max_gain = float(params.get("max_local_gain", 0.0))
+            summary += (
+                f"; MaxGain={max_gain:.0f}x"
+                if max_gain >= 1.0
+                else "; MaxGain=Off"
+            )
             if self._fieldscale_temporal:
                 summary += (
                     "; Temporal="
@@ -4844,11 +5172,18 @@ class AlgorithmPipelineEditor(QWidget):
             return f"clip={params['clahe_clip']:.1f}, grid={params['clahe_grid']}"
         if stage.algorithm_key == "gamma":
             return f"gamma={params['gamma']:.1f}"
+        if stage.algorithm_key == "median":
+            size = params["median_kernel_size"]
+            return f"kernel={size}x{size}"
+        if stage.algorithm_key == "gaussian":
+            size = params["gaussian_kernel_size"]
+            return f"kernel={size}x{size}, sigma={params['gaussian_sigma']:.1f}"
         if stage.algorithm_key == "dde":
             return (
-                f"sigma={params.get('dde_sigma', 1.0):.1f}, "
-                f"alpha={params.get('dde_alpha', 1.5):.1f}, "
-                f"beta={params.get('dde_beta', 0.5):.1f}"
+                f"sigma_s={params.get('dde_sigma_s', 8)}, "
+                f"sigma_r={params.get('dde_sigma_r', 16)}, "
+                f"gain={params.get('dde_gain_percent', 150)}%, "
+                f"iterations={params.get('dde_num_iters', 3)}"
             )
         if stage.algorithm_key == "bilateral":
             return f"strength={params['bilateral_strength']}"
@@ -4974,6 +5309,9 @@ class AlgorithmPipelineEditor(QWidget):
             stage.parameters["message_passing_iterations"] = (
                 self.stage_fieldscale_message_iterations.value()
             )
+            stage.parameters["max_local_gain"] = float(
+                self.stage_fieldscale_max_local_gain.currentData()
+            )
             if self._fieldscale_temporal:
                 stage.parameters["temporal_smoothing_percent"] = (
                     self.stage_fieldscale_temporal_smoothing.value()
@@ -4985,10 +5323,20 @@ class AlgorithmPipelineEditor(QWidget):
             stage.parameters["clahe_grid"] = self.stage_clahe_grid.value()
         elif stage.algorithm_key == "gamma":
             stage.parameters["gamma"] = self.stage_gamma.value()
+        elif stage.algorithm_key == "median":
+            stage.parameters["median_kernel_size"] = (
+                self.stage_median_kernel_size.currentData()
+            )
+        elif stage.algorithm_key == "gaussian":
+            stage.parameters["gaussian_kernel_size"] = (
+                self.stage_gaussian_kernel_size.currentData()
+            )
+            stage.parameters["gaussian_sigma"] = self.stage_gaussian_sigma.value()
         elif stage.algorithm_key == "dde":
-            stage.parameters["dde_sigma"] = self.stage_dde_sigma.value()
-            stage.parameters["dde_alpha"] = self.stage_dde_alpha.value()
-            stage.parameters["dde_beta"] = self.stage_dde_beta.value()
+            stage.parameters["dde_sigma_s"] = self.stage_dde_sigma_s.value()
+            stage.parameters["dde_sigma_r"] = self.stage_dde_sigma_r.value()
+            stage.parameters["dde_gain_percent"] = self.stage_dde_gain_percent.value()
+            stage.parameters["dde_num_iters"] = self.stage_dde_num_iters.value()
         elif stage.algorithm_key == "bilateral":
             stage.parameters["bilateral_strength"] = self.stage_bilateral_strength.value()
         elif stage.algorithm_key == "unsharp":
@@ -5036,11 +5384,25 @@ class AlgorithmPipelineEditor(QWidget):
             self.stage_clahe_clip.setValue(params.get("clahe_clip", 2.0))
             self.stage_clahe_grid.setValue(params.get("clahe_grid", 8))
             self.stage_gamma.setValue(params.get("gamma", 0.7))
+            median_kernel_index = self.stage_median_kernel_size.findData(
+                params.get("median_kernel_size", 3)
+            )
+            self.stage_median_kernel_size.setCurrentIndex(
+                median_kernel_index if median_kernel_index >= 0 else 0
+            )
+            gaussian_kernel_index = self.stage_gaussian_kernel_size.findData(
+                params.get("gaussian_kernel_size", 5)
+            )
+            self.stage_gaussian_kernel_size.setCurrentIndex(
+                gaussian_kernel_index if gaussian_kernel_index >= 0 else 1
+            )
+            self.stage_gaussian_sigma.setValue(params.get("gaussian_sigma", 1.0))
             self.stage_bilateral_strength.setValue(params.get("bilateral_strength", 2))
             self.stage_unsharp_amount.setValue(params.get("unsharp_amount", 1.0))
-            self.stage_dde_sigma.setValue(params.get("dde_sigma", 1.0))
-            self.stage_dde_alpha.setValue(params.get("dde_alpha", 1.5))
-            self.stage_dde_beta.setValue(params.get("dde_beta", 0.5))
+            self.stage_dde_sigma_s.setValue(params.get("dde_sigma_s", 8))
+            self.stage_dde_sigma_r.setValue(params.get("dde_sigma_r", 16))
+            self.stage_dde_gain_percent.setValue(params.get("dde_gain_percent", 150))
+            self.stage_dde_num_iters.setValue(params.get("dde_num_iters", 3))
             grid_index = self.stage_fieldscale_grid_count.findData(
                 params.get("grid_count", 8)
             )
@@ -5060,6 +5422,12 @@ class AlgorithmPipelineEditor(QWidget):
             self.stage_fieldscale_message_iterations.setValue(
                 params.get("message_passing_iterations", 7)
             )
+            max_gain_index = self.stage_fieldscale_max_local_gain.findData(
+                float(params.get("max_local_gain", 0.0))
+            )
+            self.stage_fieldscale_max_local_gain.setCurrentIndex(
+                max_gain_index if max_gain_index >= 0 else 0
+            )
             self.stage_fieldscale_temporal_smoothing.setValue(
                 params.get("temporal_smoothing_percent", 90)
             )
@@ -5073,6 +5441,7 @@ class AlgorithmPipelineEditor(QWidget):
                 self.stage_fieldscale_les_threshold,
                 self.stage_fieldscale_message_distance,
                 self.stage_fieldscale_message_iterations,
+                self.stage_fieldscale_max_local_gain,
             ):
                 self.set_parameter_visible(widget, is_fieldscale)
             self.set_parameter_visible(
@@ -5092,10 +5461,20 @@ class AlgorithmPipelineEditor(QWidget):
                 self.stage_clahe_grid, stage.algorithm_key == "clahe"
             )
             self.set_parameter_visible(self.stage_gamma, stage.algorithm_key == "gamma")
+            self.set_parameter_visible(
+                self.stage_median_kernel_size, stage.algorithm_key == "median"
+            )
+            self.set_parameter_visible(
+                self.stage_gaussian_kernel_size, stage.algorithm_key == "gaussian"
+            )
+            self.set_parameter_visible(
+                self.stage_gaussian_sigma, stage.algorithm_key == "gaussian"
+            )
             for widget in (
-                self.stage_dde_sigma,
-                self.stage_dde_alpha,
-                self.stage_dde_beta,
+                self.stage_dde_sigma_s,
+                self.stage_dde_sigma_r,
+                self.stage_dde_gain_percent,
+                self.stage_dde_num_iters,
             ):
                 self.set_parameter_visible(
                     widget, stage.algorithm_key == "dde"
@@ -7932,31 +8311,151 @@ class ThermalRawToolkit(QMainWindow):
         image_input_note.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         f.addRow(image_input_note)
         self.raw_input_mapping_combo = FocusWheelComboBox()
-        for mapping_name, mapping_key in RAW_INPUT_MAPPING_OPTIONS:
+        for mapping_name, mapping_key in TONE_MAPPING_OPTIONS:
             self.raw_input_mapping_combo.addItem(mapping_name, mapping_key)
         self.raw_input_mapping_combo.setSizePolicy(
             QSizePolicy.Expanding, QSizePolicy.Fixed
         )
         self.raw_input_mapping_note = QLabel(
-            "Input Mapping runs before the display pipeline. With Fixed Bit Depth "
-            "and Fieldscale as the first enabled step, Fieldscale reads native grayscale values "
-            "(RAW: original DN); following steps are 8-bit. Image bit depth is detected automatically."
+            "Tone Mapping is the single native-DN to 8-bit conversion stage. "
+            "All Algorithm Pipeline steps below receive its 8-bit output."
         )
         self.raw_input_mapping_note.setWordWrap(True)
         self.raw_input_mapping_note.setSizePolicy(
             QSizePolicy.Ignored, QSizePolicy.Preferred
         )
         self.raw_input_mapping_note.setStyleSheet("color:#c98;")
+        self.tone_mapping_parameter_group = CollapsibleGroupBox(
+            "Tone Mapping Parameters"
+        )
+        self.tone_mapping_parameter_group.setObjectName("pipelineParameterCard")
+        self.tone_mapping_parameter_layout = QVBoxLayout(
+            self.tone_mapping_parameter_group
+        )
+        self.tone_mapping_parameter_layout.setContentsMargins(10, 10, 10, 10)
+        self.tone_mapping_parameter_layout.setSpacing(8)
+
+        self.tone_black_dn = FocusWheelSpinBox()
+        self.tone_black_dn.setRange(0, 65534)
+        self.tone_black_dn.setValue(0)
+        self.tone_white_dn = FocusWheelSpinBox()
+        self.tone_white_dn.setRange(1, 65535)
+        self.tone_white_dn.setValue(FIELDSCALE_RAW14_MAX)
+        self.tone_low_percentile = FocusWheelDoubleSpinBox()
+        self.tone_low_percentile.setRange(0.0, 99.5)
+        self.tone_low_percentile.setDecimals(1)
+        self.tone_low_percentile.setSingleStep(0.5)
+        self.tone_low_percentile.setValue(1.0)
+        self.tone_high_percentile = FocusWheelDoubleSpinBox()
+        self.tone_high_percentile.setRange(0.5, 100.0)
+        self.tone_high_percentile.setDecimals(1)
+        self.tone_high_percentile.setSingleStep(0.5)
+        self.tone_high_percentile.setValue(99.0)
+        self.tone_exclude_zero = QCheckBox("Exclude zero DN from histogram")
+        self.tone_clahe_clip = FocusWheelDoubleSpinBox()
+        self.tone_clahe_clip.setRange(0.1, 100.0)
+        self.tone_clahe_clip.setDecimals(1)
+        self.tone_clahe_clip.setSingleStep(0.1)
+        self.tone_clahe_clip.setValue(2.0)
+        self.tone_clahe_clip.setToolTip(
+            "8-bit-equivalent Clip Limit. The Toolkit scales this value for the "
+            "native input bit depth before calling OpenCV CLAHE."
+        )
+        self.tone_clahe_grid = FocusWheelSpinBox()
+        self.tone_clahe_grid.setRange(1, 64)
+        self.tone_clahe_grid.setValue(8)
+        self.tone_fieldscale_grid = FocusWheelComboBox()
+        for grid_count in (2, 4, 8, 16, 32):
+            self.tone_fieldscale_grid.addItem(
+                f"{grid_count} x {grid_count}", grid_count
+            )
+        self.tone_fieldscale_grid.setCurrentIndex(
+            self.tone_fieldscale_grid.findData(8)
+        )
+        self.tone_fieldscale_les_distance = FocusWheelSpinBox()
+        self.tone_fieldscale_les_distance.setRange(1, 7)
+        self.tone_fieldscale_les_distance.setValue(2)
+        self.tone_fieldscale_les_threshold = FocusWheelSpinBox()
+        self.tone_fieldscale_les_threshold.setRange(0, FIELDSCALE_RAW14_MAX)
+        self.tone_fieldscale_les_threshold.setValue(400)
+        self.tone_fieldscale_les_threshold.setSuffix(" RAW14 DN")
+        self.tone_fieldscale_message_distance = FocusWheelSpinBox()
+        self.tone_fieldscale_message_distance.setRange(1, 7)
+        self.tone_fieldscale_message_distance.setValue(1)
+        self.tone_fieldscale_message_iterations = FocusWheelSpinBox()
+        self.tone_fieldscale_message_iterations.setRange(0, 32)
+        self.tone_fieldscale_message_iterations.setValue(7)
+        self.tone_fieldscale_max_local_gain = FocusWheelComboBox()
+        self.tone_fieldscale_max_local_gain.addItem("Off (Reference)", 0.0)
+        for gain in (1, 2, 4, 8, 16, 32):
+            self.tone_fieldscale_max_local_gain.addItem(f"{gain} x", float(gain))
+        self.tone_fieldscale_max_local_gain.setToolTip(
+            "Limits flat-region noise amplification. Off preserves the "
+            "public-reference Fieldscale output."
+        )
+        self.tone_mapping_calculated = QLabel(
+            "Load a RAW or image file to show the calculated mapping range."
+        )
+        self.tone_mapping_calculated.setWordWrap(True)
+        self.tone_mapping_calculated.setStyleSheet(
+            "color:#c8d0d9; background:#292d33; border-left:3px solid #79afd3; "
+            "border-radius:5px; padding:7px;"
+        )
+        self.tone_mapping_reset = QPushButton("Reset Mapping Parameters")
+        self.tone_mapping_parameter_widgets = {
+            "black_dn": self.tone_black_dn,
+            "white_dn": self.tone_white_dn,
+            "low_percentile": self.tone_low_percentile,
+            "high_percentile": self.tone_high_percentile,
+            "exclude_zero": self.tone_exclude_zero,
+            "clahe_clip": self.tone_clahe_clip,
+            "clahe_grid": self.tone_clahe_grid,
+            "grid_count": self.tone_fieldscale_grid,
+            "les_distance": self.tone_fieldscale_les_distance,
+            "les_threshold_raw14": self.tone_fieldscale_les_threshold,
+            "message_passing_distance": self.tone_fieldscale_message_distance,
+            "message_passing_iterations": self.tone_fieldscale_message_iterations,
+            "max_local_gain": self.tone_fieldscale_max_local_gain,
+        }
+        self.tone_mapping_parameter_rows = {}
+        for label, key in (
+            ("Black DN", "black_dn"),
+            ("White DN", "white_dn"),
+            ("Low Percentile", "low_percentile"),
+            ("High Percentile", "high_percentile"),
+            ("Histogram", "exclude_zero"),
+            ("CLAHE Clip Limit (8-bit equivalent)", "clahe_clip"),
+            ("CLAHE Grid Size", "clahe_grid"),
+            ("Grid Count", "grid_count"),
+            ("LES Distance", "les_distance"),
+            ("LES Threshold", "les_threshold_raw14"),
+            ("Message Passing Distance", "message_passing_distance"),
+            ("Message Passing Iterations", "message_passing_iterations"),
+            ("Max Local Gain", "max_local_gain"),
+        ):
+            row = QWidget()
+            row_layout = QVBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
+            row_layout.addWidget(QLabel(label))
+            row_layout.addWidget(self.tone_mapping_parameter_widgets[key])
+            self.tone_mapping_parameter_layout.addWidget(row)
+            self.tone_mapping_parameter_rows[key] = row
+        self.tone_mapping_parameter_layout.addWidget(self.tone_mapping_calculated)
+        self.tone_mapping_parameter_layout.addWidget(self.tone_mapping_reset)
         self.raw_pipeline_editor = AlgorithmPipelineEditor(
-            allow_step_algorithm_change=False
+            allow_step_algorithm_change=False,
+            title_text="8-bit Enhancement Pipeline (top to bottom)",
+            title_pixel_size=19,
         )
         self.raw_preview_stage_combo = FocusWheelComboBox()
         self.raw_preview_stage_combo.setSizePolicy(
             QSizePolicy.Expanding, QSizePolicy.Fixed
         )
         f.addRow("RAW / Image File", self.raw_algorithm_file)
-        f.addRow("Input Mapping", self.raw_input_mapping_combo)
+        f.addRow("RAW to 8-bit Tone Mapping", self.raw_input_mapping_combo)
         f.addRow(self.raw_input_mapping_note)
+        f.addRow(self.tone_mapping_parameter_group)
         f.addRow(self.raw_pipeline_editor)
         f.addRow("Right Preview", self.raw_preview_stage_combo)
         self.algorithm_compare_mode = FocusWheelComboBox()
@@ -7991,6 +8490,7 @@ class ThermalRawToolkit(QMainWindow):
             "Image Quality: Original (A) vs Final Pipeline (B)"
         )
         f.addRow(self.raw_algorithm_quality_group)
+        self.algorithm_image_name_changed()
         self.stack.addWidget(p)
         self.raw_algorithm_file.edit.textChanged.connect(
             self.invalidate_raw_pipeline_source
@@ -8004,6 +8504,27 @@ class ThermalRawToolkit(QMainWindow):
         self.raw_input_mapping_combo.currentIndexChanged.connect(
             self.update_raw_pipeline_ui
         )
+        for widget in (
+            self.tone_black_dn,
+            self.tone_white_dn,
+            self.tone_low_percentile,
+            self.tone_high_percentile,
+            self.tone_clahe_clip,
+            self.tone_clahe_grid,
+            self.tone_fieldscale_les_distance,
+            self.tone_fieldscale_les_threshold,
+            self.tone_fieldscale_message_distance,
+            self.tone_fieldscale_message_iterations,
+        ):
+            widget.valueChanged.connect(self.update_raw_pipeline_ui)
+        self.tone_exclude_zero.toggled.connect(self.update_raw_pipeline_ui)
+        self.tone_fieldscale_grid.currentIndexChanged.connect(
+            self.update_raw_pipeline_ui
+        )
+        self.tone_fieldscale_max_local_gain.currentIndexChanged.connect(
+            self.update_raw_pipeline_ui
+        )
+        self.tone_mapping_reset.clicked.connect(self.reset_tone_mapping_parameters)
         self.raw_pipeline_editor.pipeline_changed.connect(
             self.update_raw_pipeline_ui
         )
@@ -8208,54 +8729,114 @@ class ThermalRawToolkit(QMainWindow):
         )
         return pixels, info
 
+    def configure_tone_mapping_input_range(self, info):
+        value_max = max(1, int(info["value_max"]))
+        previous_max = getattr(self, "_tone_mapping_input_max", None)
+        previous_white = self.tone_white_dn.value()
+        for widget in (self.tone_black_dn, self.tone_white_dn):
+            widget.blockSignals(True)
+        self.tone_black_dn.setRange(0, max(0, value_max - 1))
+        self.tone_white_dn.setRange(1, value_max)
+        self.tone_black_dn.setValue(min(self.tone_black_dn.value(), value_max - 1))
+        if previous_max is None or previous_white == previous_max or previous_white > value_max:
+            self.tone_white_dn.setValue(value_max)
+        for widget in (self.tone_black_dn, self.tone_white_dn):
+            widget.setSuffix(" DN")
+            widget.blockSignals(False)
+        self._tone_mapping_input_max = value_max
+
     def sync_image_input_mapping(self):
-        combo = self.raw_input_mapping_combo
-        selected = combo.currentData()
-        if selected in ("fixed_scale", "raw_percentile_preview"):
-            self._preferred_raw_mapping = selected
-        preferred = getattr(self, "_preferred_raw_mapping", "fixed_scale")
-        first = next((stage for stage in self.raw_pipeline_editor.stages() if stage.enabled), None)
-        first_key = first.algorithm_key if first is not None else None
-        info = getattr(self, "raw_algorithm_info", {}) if self.raw_algorithm_source is not None else {}
-        if info.get("source_type") == "image":
-            options = [("None (Image Input)", "image_input")]
-            note = "Image input uses grayscale values without percentile mapping. Native precision is kept for a first Fieldscale or Percentile Auto Contrast step; otherwise 16-bit input is scaled to 8-bit automatically."
-        elif first_key == "fieldscale":
-            options = [("None (Fieldscale)", "pipeline_fieldscale")]
-            note = "Fieldscale receives original grayscale values. Input Mapping is bypassed."
-        elif first_key == "auto_contrast":
-            options = [("Percentile Auto Contrast (Pipeline)", "pipeline_auto_contrast")]
-            note = "The first Percentile Auto Contrast step receives original grayscale values and applies its Step Parameters once."
-        else:
-            options = RAW_INPUT_MAPPING_OPTIONS
-            note = "Mapping runs before the pipeline, including when the pipeline is empty. Left: fixed-scale original. Right: mapping and pipeline result."
-        combo.blockSignals(True)
-        combo.clear()
-        for label, key in options:
-            combo.addItem(label, key)
-        combo.setCurrentIndex(max(0, combo.findData(preferred)))
-        combo.setEnabled(options is RAW_INPUT_MAPPING_OPTIONS)
-        combo.blockSignals(False)
-        self.raw_input_mapping_note.setText(note)
-        return first_key
+        method = self.raw_input_mapping_combo.currentData() or "linear"
+        visible_keys = {
+            "linear": {"black_dn", "white_dn"},
+            "percentile": {"low_percentile", "high_percentile"},
+            "hist_equalization": {"exclude_zero"},
+            "clahe": {"clahe_clip", "clahe_grid"},
+            "fieldscale": {
+                "grid_count", "les_distance", "les_threshold_raw14",
+                "message_passing_distance", "message_passing_iterations",
+                "max_local_gain",
+            },
+        }.get(method, set())
+        for key, row in self.tone_mapping_parameter_rows.items():
+            row.setVisible(key in visible_keys)
+        descriptions = {
+            "linear": "Original values between Black DN and White DN are mapped linearly to 0..255.",
+            "percentile": "Percentiles are calculated from original values and mapped once to 0..255.",
+            "hist_equalization": "The histogram and CDF are calculated in the original native-DN domain.",
+            "clahe": "CLAHE operates in the native-DN domain. Clip Limit uses an 8-bit-equivalent scale and is converted for the detected bit depth before calling OpenCV.",
+            "fieldscale": "Fieldscale receives original values and produces the 8-bit pipeline input.",
+        }
+        self.raw_input_mapping_note.setText(
+            descriptions.get(method, "")
+            + " All Algorithm Pipeline steps below receive 8-bit input."
+        )
+        return method
+
+    def current_tone_mapping_parameters(self):
+        values = {
+            "black_dn": self.tone_black_dn.value(),
+            "white_dn": self.tone_white_dn.value(),
+            "low_percentile": self.tone_low_percentile.value(),
+            "high_percentile": self.tone_high_percentile.value(),
+            "exclude_zero": self.tone_exclude_zero.isChecked(),
+            "clahe_clip": self.tone_clahe_clip.value(),
+            "clahe_grid": self.tone_clahe_grid.value(),
+            "grid_count": self.tone_fieldscale_grid.currentData(),
+            "les_distance": self.tone_fieldscale_les_distance.value(),
+            "les_threshold_raw14": self.tone_fieldscale_les_threshold.value(),
+            "message_passing_distance": self.tone_fieldscale_message_distance.value(),
+            "message_passing_iterations": self.tone_fieldscale_message_iterations.value(),
+            "max_local_gain": float(
+                self.tone_fieldscale_max_local_gain.currentData()
+            ),
+        }
+        method = self.raw_input_mapping_combo.currentData() or "linear"
+        return {
+            key: values[key]
+            for key in DEFAULT_TONE_MAPPING_PARAMETERS[method]
+        }
+
+    def reset_tone_mapping_parameters(self):
+        method = self.raw_input_mapping_combo.currentData() or "linear"
+        input_max = getattr(self, "raw_algorithm_info", {}).get(
+            "value_max", (1 << self.bit_depth) - 1
+        )
+        defaults = tone_mapping_parameters(method, input_max=input_max)
+        widgets = self.tone_mapping_parameter_widgets
+        for key, value in defaults.items():
+            widget = widgets[key]
+            if isinstance(widget, QCheckBox):
+                widget.setChecked(bool(value))
+            elif isinstance(widget, QComboBox):
+                widget.setCurrentIndex(max(0, widget.findData(value)))
+            else:
+                widget.setValue(value)
+        self.update_raw_pipeline_ui()
 
     def prepare_raw_pipeline_input(self, raw):
-        first_key = self.sync_image_input_mapping()
+        method = self.sync_image_input_mapping()
         self.update_image_preview_titles()
         info = self.raw_algorithm_info
-        if first_key in ("fieldscale", "auto_contrast"):
-            return (
-                raw.copy(), info["value_max"],
-                f"Original {info['value_name']} 0..{info['value_max']} -> first {algorithm_display_name(first_key)} step; no separate mapping",
-            )
-        if self.raw_input_mapping_combo.currentData() == "raw_percentile_preview":
-            mapped, p1, p99 = percentile_preview_u8(raw)
-            return mapped, 255, f"Original {info['value_name']} P1={p1:.1f}, P99={p99:.1f} -> 8-bit"
-        return (
-            raw_to_display_u8(raw, info["value_max"]), 255,
-            f"Fixed 0..{info['value_max']} {info['value_name']} -> 0..255"
-            + (" (automatic image format conversion; no percentile mapping)" if info["source_type"] == "image" else ""),
+        mapped, details, calculated, used_parameters = apply_tone_mapping(
+            raw,
+            method,
+            info["value_max"],
+            self.current_tone_mapping_parameters(),
+            pad_fieldscale_input=info["source_type"] == "image",
         )
+        self.raw_tone_mapping_calculated = calculated
+        self.raw_tone_mapping_parameters = used_parameters
+        calculated_text = (
+            f"Input: {info['bit_depth']}-bit {info['value_name']} 0..{info['value_max']}\n"
+            f"Used: {details}\nOutput: 8-bit 0..255"
+        )
+        self.tone_mapping_calculated.setText(calculated_text)
+        self.tone_mapping_calculated.setStyleSheet(
+            "color:#c8d0d9; background:#292d33; border-left:3px solid #79afd3; "
+            "border-radius:5px; padding:7px;"
+        )
+        return mapped, 255, details
 
     def update_raw_pipeline_ui(self, _value=None):
         self.sync_image_input_mapping()
@@ -8301,6 +8882,11 @@ class ThermalRawToolkit(QMainWindow):
             if self.current_function_index() == len(self.FUNCTIONS) - 2:
                 self.preview_result.set_array(None)
                 self.run_btn.setEnabled(False)
+            self.tone_mapping_calculated.setText(f"Invalid mapping: {exc}")
+            self.tone_mapping_calculated.setStyleSheet(
+                "color:#ff9d9d; background:#35292b; border-left:3px solid #e36b6b; "
+                "border-radius:5px; padding:7px;"
+            )
             self.log.append(f"RAW pipeline preview error: {exc}")
             return False
         self.raw_pipeline_input = pipeline_input
@@ -8326,6 +8912,7 @@ class ThermalRawToolkit(QMainWindow):
         return True
 
     def update_raw_stage_preview(self, _combo_index=None):
+        self.algorithm_image_name_changed()
         if self.raw_pipeline_final is None:
             return
         selected_pipeline_index = self.raw_preview_stage_combo.currentData()
@@ -8491,6 +9078,15 @@ class ThermalRawToolkit(QMainWindow):
     def algorithm_image_name_changed(self, _value=None):
         for combo, custom in self.algorithm_name_fields:
             custom.setVisible(combo.currentData() == "custom")
+        names = self.algorithm_image_names()
+        quality_headers = getattr(
+            getattr(self, "raw_algorithm_quality_group", None),
+            "comparison_header_labels",
+            (),
+        )
+        if len(quality_headers) == 2:
+            quality_headers[0].setText(names[0])
+            quality_headers[1].setText(names[1])
         if self.FUNCTIONS[self.current_function_index()] == "Image Algorithm Compare":
             self.update_image_preview_titles()
             self.update_image_preview_window(self.preview_original)
@@ -8977,6 +9573,7 @@ class ThermalRawToolkit(QMainWindow):
         try:
             raw_path = self.raw_algorithm_file.text()
             self.raw_algorithm_source, self.raw_algorithm_info = self.load_analysis_source(raw_path)
+            self.configure_tone_mapping_input_range(self.raw_algorithm_info)
             if not self.refresh_raw_pipeline_preview():
                 return
             original_score = self.raw_algorithm_quality_original["metrics"][
@@ -9693,6 +10290,7 @@ class ThermalRawToolkit(QMainWindow):
 
     def run_raw_algorithm(self):
         raw, self.raw_algorithm_info = self.load_analysis_source(self.raw_algorithm_file.text())
+        self.configure_tone_mapping_input_range(self.raw_algorithm_info)
         raw8 = raw_to_display_u8(raw, self.raw_algorithm_info["value_max"])
         stages = self.raw_pipeline_editor.stages()
         pipeline_input, input_max, mapping_details = (
@@ -9721,10 +10319,9 @@ class ThermalRawToolkit(QMainWindow):
         )
 
         out = self.make_output("raw_algorithm_compare")
-        original_path = out / "original_fixed.png"
-        mapping_path = out / (
-            "input_native_dn.png" if input_max > 255 else "input_mapped.png"
-        )
+        original_path = out / "reference_linear.png"
+        mapping_method = self.raw_input_mapping_combo.currentData() or "linear"
+        mapping_path = out / f"tone_mapped_{mapping_method}.png"
         result_path = out / "final_pipeline.png"
         overview_path = out / "00_pipeline_overview.png"
         base_original_path = out / "base_original.png"
@@ -9754,8 +10351,8 @@ class ThermalRawToolkit(QMainWindow):
 
         mapping_label = self.raw_input_mapping_combo.currentText()
         overview_items = [
-            ("00 Original Fixed", raw8, 255),
-            (f"01 Pipeline Input - {mapping_label}", pipeline_input, input_max),
+            ("00 Linear Reference", raw8, 255),
+            (f"01 Tone Mapping - {mapping_label}", pipeline_input, input_max),
         ]
         for overview_index, record in enumerate(records, start=2):
             overview_items.append(
@@ -9787,7 +10384,7 @@ class ThermalRawToolkit(QMainWindow):
         self.log.append(f"Saved comparison preview: {comparison_path}")
 
         manifest = {
-            "format_version": 2,
+            "format_version": 3,
             "mode": "raw_algorithm_compare",
             "comparison_view": self.algorithm_compare_mode.currentText(),
             "swipe_position": self.dual_swipe_preview.position,
@@ -9800,11 +10397,16 @@ class ThermalRawToolkit(QMainWindow):
             "source_info": self.raw_algorithm_info,
             "bit_depth": self.raw_algorithm_info["bit_depth"],
             "quality_profile": "RAW Full",
-            "input_mapping": {
-                "key": self.raw_input_mapping_combo.currentData(),
+            "tone_mapping": {
+                "method": mapping_method,
                 "name": self.raw_input_mapping_combo.currentText(),
+                "input_domain": "native_dn",
+                "output_domain": "display_u8",
+                "parameters": dict(self.raw_tone_mapping_parameters),
+                "calculated": dict(self.raw_tone_mapping_calculated),
                 "details": mapping_details,
-                "input_max": input_max,
+                "input_max": self.raw_algorithm_info["value_max"],
+                "output_max": 255,
                 "output_file": mapping_path.name,
             },
             "pipeline": self.raw_pipeline_editor.configuration(),
@@ -9833,7 +10435,7 @@ class ThermalRawToolkit(QMainWindow):
             json.dump(manifest, destination, ensure_ascii=False, indent=2)
         with open(out / "pipeline_summary.txt", "w", encoding="utf-8") as summary:
             summary.write(f"Source: {manifest['source']}\n")
-            summary.write(f"Input Mapping: {mapping_details}\n")
+            summary.write(f"Tone Mapping: {mapping_details}\n")
             summary.write(f"Pipeline: {self.raw_pipeline_editor.summary()}\n")
             summary.write(f"Overview: {overview_path.name}\n")
             summary.write(
@@ -9871,7 +10473,7 @@ class ThermalRawToolkit(QMainWindow):
             ],
         )
 
-        self.log.append(f"Input Mapping: {mapping_details}")
+        self.log.append(f"Tone Mapping: {mapping_details}")
         self.log.append(f"Pipeline: {self.raw_pipeline_editor.summary()}")
         for record in records:
             self.log.append(
@@ -9931,21 +10533,6 @@ class ThermalRawToolkit(QMainWindow):
                 )
                 if preferred_device_id and device_id == preferred_device_id:
                     selected_item = item_index
-
-            if preferred_device_id and selected_item < 0:
-                disconnected_name = preferred_name or "Previously selected camera"
-                combo.addItem(f"Disconnected - {disconnected_name}", None)
-                selected_item = combo.count() - 1
-                combo.setItemData(
-                    selected_item,
-                    preferred_device_id,
-                    CAMERA_DEVICE_ID_ROLE,
-                )
-                combo.setItemData(
-                    selected_item,
-                    disconnected_name,
-                    CAMERA_FRIENDLY_NAME_ROLE,
-                )
 
             if combo.count() == 0:
                 combo.addItem("No camera detected", None)

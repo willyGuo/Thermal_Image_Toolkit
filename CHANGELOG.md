@@ -1,5 +1,18 @@
 # Thermal RAW Toolkit
 
+## v1.4.1 - 2026-09-14
+
+- Replace Image/UVC DDE with the firmware Y8 Domain Transform algorithm; expose Sigma S, Sigma R, Gain (%) and Iterations (defaults 8/16/150/3), without NLM or percentile stretching.
+
+- Add configurable Median and Gaussian filters to both Image Algorithm Compare and UVC Algorithm Compare pipelines.
+- Replace Image Algorithm Compare's implicit Input Mapping rules with one explicit native-DN to 8-bit Tone Mapping stage.
+- Add live, method-specific controls for Linear Full Range, Percentile, native-DN Global Histogram Equalization, native-DN CLAHE and Fieldscale.
+- Make native-DN CLAHE bit-depth aware: RAW14 is left-aligned in `uint16`, OpenCV uses 256 effective histogram bins through `bitShift=8`, and Clip Limit keeps its familiar 8-bit-equivalent scale.
+- Increase the Image Algorithm Compare `8-bit Enhancement Pipeline` heading size and synchronize Image Quality metric A/B headers with Automatic, preset and Custom image names, including Right Preview stage changes.
+- Keep every following Image Algorithm Pipeline step in the 8-bit domain, show the calculated mapping range immediately and disable Save when mapping parameters are invalid.
+- Export `reference_linear.png`, method-named `tone_mapped_*.png` files and domain/parameter/calculated-value metadata in `pipeline.json` format version 3.
+- Refresh Camera lists from the currently connected devices only; a removed USB camera no longer leaves a stale index, name or disconnected placeholder.
+
 ## v1.4.0 ? 2026-09-10
 
 - Dual Image Compare ? Image Algorithm Compare ?? Side by Side?Swipe Compare?????????????
