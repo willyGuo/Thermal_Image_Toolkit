@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Image Quality Metrics — 計算方式</title>
+<style>body{background:#181a1e;color:#e7e9ed;font:17px 'Segoe UI',sans-serif;max-width:1000px;margin:32px auto;padding:20px;line-height:1.7}h1,h2,a{color:#86bce2}td,th{border:1px solid #46515c;padding:12px}table{border-collapse:collapse;width:100%}code{color:#c9e2f2}</style></head>
+<body><h1 id="raw">Image Quality：Fieldscale IQA 指標</h1>
+<p>靜態影像使用以下五項指標，不再提供加權總分。UVC 已移除評分功能。數值用於相同場景與解析度的比較，並非 PASS／FAIL 規格。</p>
+<table><tr><th>指標</th><th>定義</th><th>方向</th></tr>
+<tr><td>Gradient</td><td>8-bit 灰階除以 255；3×3 Sobel（scale=1/8）的梯度幅值平均。高值也可能來自雜訊或銳化。</td><td>↑</td></tr>
+<tr><td>Entropy</td><td>256-bin Shannon entropy / 8，範圍 0..1。反映灰階分布，不能單獨證明細節品質。</td><td>↑</td></tr>
+<tr><td>C_global</td><td>對應 RAW／輸出在 log-domain 的 Gaussian 對比差異，Gaussian 9×9、σ=3。負值表示輸出對比增加。</td><td>↓</td></tr>
+<tr><td>C_local</td><td>對應 RAW／輸出在 log-domain 的 bilateral residual 對比差異，σ_color=0.2、σ_space=10。保留負值。</td><td>↓</td></tr>
+<tr><td>TMQI</td><td>五尺度結構保真度與統計自然度組成的 Tone Mapped Image Quality Index，0..1。</td><td>↑</td></tr></table>
+<h2>參考影像與 N/A</h2>
+<p>Image Algorithm Compare：A 為原圖固定全位深縮放的 8-bit 影像，B 為最終 Pipeline 輸出；兩者使用同一張原始影像作參考。分數固定評估 A／B，不隨預覽階段切換。</p>
+<p>Single Image Statistics 與 Dual Image Compare：各自評估固定縮放後的 8-bit 顯示影像，不自動把兩個檔案視為同場景配對。因此 C_global、C_local、TMQI 顯示 N/A。TMQI 另外要求原始影像非均勻且寬高至少 161；不自動放大小圖或減少尺度。N/A 不是 0 分。</p>
+<h2>計算來源</h2>
+<p>指標集合依據 <a href="https://arxiv.org/html/2405.15395v1#S4.SS2">Fieldscale，IV-B</a>。
+對比損失與 TMQI 對照 <a href="https://github.com/HensoldtOptronicsCV/ToneMappingIQA">Teutsch 等人的公開實作</a>，TMQI 原始方法為 <a href="https://ece.uwaterloo.ca/~z70wang/research/tmqi/">Yeganeh 與 Wang（2013）</a>。</p>
+<p>Fieldscale 未公開完整的評估程式及 Gradient 算子細節；本工具採上述明確定義，不宣稱與論文 Table I 數值完全一致。對比損失依原始位深除以 2^bits、輸出除以 256 並使用 gamma=2.2，再取 log10；零值依參考實作替換為最小正值。</p>
+<p>Save 會儲存 JSON、文字摘要及 Excel，各指標分開繪圖；顯示影像與梯度圖會一併匯出。預覽不寫檔。</p>
+<style>
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#22252a;border-left:4px solid #79afd3;padding:16px;line-height:1.7;font-size:15px}
+h2{margin-top:40px;border-bottom:1px solid #46515c;padding-bottom:8px}h3{color:#c9e2f2}th{background:#29323a}td,th{text-align:left;vertical-align:top}
+.example{background:#222b26;border-left:4px solid #6aaa7d;padding:12px 18px}.note{background:#29323a;padding:12px 18px}li{margin-bottom:8px}
+nav a{display:inline-block;margin:4px 12px 4px 0}
+@media(max-width:650px){body{padding:12px;font-size:16px}td,th{padding:7px}pre{font-size:13px}}
+@media print{body{background:white;color:black;font-size:11pt}h1,h2,h3,a{color:#224a68}pre,.note,.example,th{background:#f1f3f5;color:black}}
+</style>
+<h2 id="calculation">詳細計算方式</h2>
+<nav aria-label="計算章節"><a href="#input">輸入轉換</a><a href="#gradient">Gradient</a><a href="#entropy">Entropy</a><a href="#contrast-input">對比前處理</a><a href="#global">C_global</a><a href="#local">C_local</a><a href="#tmqi">TMQI</a><a href="#na">N/A 與匯出</a></nav>
+
+<h2 id="input">1. 先確認評估的是哪一張影像</h2>
+<p><strong>R</strong> 表示映射前的參考影像，<strong>D</strong> 表示要評估的 8-bit 顯示影像。影像寬 W、高 H，像素數 P = W × H；mean(·) 是空間上的算術平均，不是跨影格的時間平均。</p>
+<p>對輸入 I 及宣告的位深上限 M，程式使用固定比例轉成 D，不做每張圖的 Min/Max 拉伸，也不額外做 P1/P99：</p>
+<pre>D = uint8(round(clip(I, 0, M) × 255 / M))
+J = D / 255</pre>
+<p>clip 表示裁切到指定範圍；round 使用 NumPy rint，取最接近整數，恰為半整數時取偶數。RAW14 的 M = 16383；8-bit 的 M = 255，已為 8-bit 的 Pipeline 輸出不會因此改變。</p>
+<div class="example">RAW14 的 8192 DN → round(8192 × 255 / 16383) = 128。Gradient／Entropy 以轉換後的 8-bit 灰階計算，而不是直接使用 8192。</div>
+<table><tr><th>頁面／欄位</th><th>被評估的 D</th><th>參考 R</th></tr>
+<tr><td>Single Image Statistics</td><td>輸入固定全位深轉 8-bit</td><td>不指定，後三項 N/A</td></tr>
+<tr><td>Dual Image Compare</td><td>A／B 各自固定全位深轉 8-bit</td><td>不自動把 A 當成 B 的參考，後三項 N/A</td></tr>
+<tr><td>Image Algorithm Compare：A</td><td>原圖固定全位深轉 8-bit</td><td>載入的原始影像</td></tr>
+<tr><td>Image Algorithm Compare：B</td><td>最終 Pipeline 的 8-bit 輸出</td><td>與 A 相同的原始影像</td></tr></table>
+<p>若載入一般 8-bit 影像，R 只有該影像已有的資訊，不會還原成 RAW。A 的 TMQI 不保證等於 1，對比損失也不保證為 0，因為 A 仍包含量化及評分前處理的影響。</p>
+
+<h2 id="gradient">2. Gradient：平均梯度幅值</h2>
+<p>將 D 除以 255 得到 J，使用以下兩個 3×3 Sobel kernel，分別計算水平與垂直變化。每個 kernel 均乘以 1/8：</p>
+<pre>Kx = (1/8) × [ -1   0   1 ]     Ky = (1/8) × [ -1  -2  -1 ]
+              [ -2   0   2 ]                   [  0   0   0 ]
+              [ -1   0   1 ]                   [  1   2   1 ]
+
+Gx = Sobel_x(J)
+Gy = Sobel_y(J)
+G(x,y) = sqrt(Gx(x,y)² + Gy(x,y)²)
+Gradient = Σ G(x,y) / P</pre>
+<ol><li>對每個位置，以周圍像素計算 Gx、Gy。</li><li>用平方和開根號合成幅值，避免正負方向相消。</li><li>將全圖幅值平均；使用 float64，邊界為 OpenCV 預設反射方式 REFLECT_101。</li></ol>
+<div class="example">假設三列都是 <code>[0, 0.5, 1]</code>，中心的 Gx = 0.5、Gy = 0，因此中心梯度幅值為 0.5。這只是中心的貢獻，整張圖還要平均其他位置。</div>
+<p>均勻影像 Gradient = 0。邊緣或紋理變強時通常增加，但雜訊、壞點或過度銳化也會增加它。Gradient 不是百分比，也不是 0–100 分。</p>
+
+<h2 id="entropy">3. Entropy：正規化灰階熵</h2>
+<p>統計 D 的 256 個灰階。若灰階 k 出現 n_k 次，其機率為 p_k = n_k / P：</p>
+<pre>H_bits = −Σ p_k × log₂(p_k)       只加總 p_k &gt; 0 的項目
+Entropy = H_bits / 8</pre>
+<p>最大熵為 log₂(256) = 8 bits；除以 8 後顯示範圍為 0..1。機率為零的灰階略過，不計算 log₂(0)。</p>
+<table><tr><th>灰階分布</th><th>H_bits</th><th>顯示的 Entropy</th></tr>
+<tr><td>全部像素相同</td><td>0</td><td>0</td></tr><tr><td>兩個灰階各占一半</td><td>1</td><td>0.125</td></tr>
+<tr><td>四個灰階各占四分之一</td><td>2</td><td>0.25</td></tr><tr><td>256 灰階均勻分布</td><td>8</td><td>1</td></tr></table>
+<p>Entropy 只看直方圖，不看像素排列。將像素位置打亂，Entropy 不變；隨機雜訊也可能有高 Entropy。因此它代表灰階分布資訊量，不直接等同物體可辨識度。</p>
+
+<h2 id="contrast-input">4. C_global／C_local 共用的前處理</h2>
+<p>先將參考 R 和輸出 D 各自正規化，對輸出做固定 gamma，再轉成以 10 為底的對數域：</p>
+<pre>R0 = clip(R, 0, M_ref) / (M_ref + 1)
+D0 = (D / 256)^2.2
+L_R = log₁₀(replace_zero(R0))
+L_D = log₁₀(replace_zero(D0))</pre>
+<p>RAW14 的參考分母為 16384，RAW16 為 65536，輸出分母為 256。此處與 Gradient 的 D/255 不同，依對比損失參考程式定義。gamma = 2.2 是<strong>評分前處理</strong>，不改動預覽，也不採用使用者在 Pipeline 設定的 Gamma 值。</p>
+<p>replace_zero：各自以該圖正規化及 gamma 後的最小正值取代零。整張全為零時，替換值為 1，因此 log 影像全為 0。轉為 float32 後才取 log10，後續濾波維持此精度。</p>
+<div class="example">RAW14：8192 / 16384 = 0.5 → L_R ≈ −0.30103。<br>8-bit：128 / 256 = 0.5 → 0.5^2.2 ≈ 0.21764 → L_D ≈ −0.66227。</div>
+
+<h2 id="global">5. C_global：全域對比損失</h2>
+<p>它不是整張圖只算一次標準差，而是<strong>先計算各位置的 Gaussian 加權標準差，再全圖平均</strong>。令 G(·) 為 9×9、σ = 3 的 Gaussian 濾波：</p>
+<pre>μ = G(L)
+V = G(L²) − μ²
+σ_local = sqrt(abs(V))
+g(L) = −mean(σ_local)
+
+C_global = g(L_D) − g(L_R)
+         = mean(σ_R) − mean(σ_D)</pre>
+<p>程式使用 sqrt(abs(V))，不是 sqrt(max(V, 0))，與參考程式一致；Gaussian 邊界採預設反射方式。</p>
+<div class="example">若參考平均 σ_R = 0.04，輸出平均 σ_D = 0.10，C_global = 0.04 − 0.10 = <strong>−0.06</strong>，表示此定義下輸出對比增加。</div>
+<p>正值代表平均對比下降，0 表示此統計量相同，負值代表增加。越低是論文採用的方向，但過度增強可能造成雜訊或不自然外觀，仍要一起查看影像及 TMQI。</p>
+
+<h2 id="local">6. C_local：局部對比損失</h2>
+<p>先用 bilateral filter 取得較平滑的基底，保留對灰階差及空間距離的考量，再計算殘差：</p>
+<pre>B(L) = bilateralFilter(L, d=−1, sigmaColor=0.2, sigmaSpace=10)
+residual = L − B(L)
+ℓ(L) = mean(L × abs(residual))
+
+C_local = ℓ(L_D) − ℓ(L_R)</pre>
+<p>d = −1 表示由 OpenCV 依 sigmaSpace 決定濾波直徑；sigmaColor 使用 log-domain 值，不是 RAW DN。邊界採預設反射方式。</p>
+<p class="note">乘的是帶符號的 L，不是 abs(L)，也不是只平均 abs(residual)。正規化後的 L 多為負數，因此 ℓ(L) 通常也是負數；不要把 C_local 再取絕對值。</p>
+<div class="example">若 ℓ(L_R) = −0.01、ℓ(L_D) = −0.04，C_local = −0.04 − (−0.01) = <strong>−0.03</strong>。</div>
+<p>這是強度加權的局部殘差指標，不是單純邊緣數量，也不是 Pixel Temporal Std。較低代表往此定義偏好的方向變化，不能獨自代表整體畫質。</p>
+
+<h2 id="tmqi">7. TMQI：多尺度結構與統計自然度</h2>
+<p>TMQI 由結構保真度 S 和統計自然度 N_nat 組成。它不使用前面 C_global／C_local 的 log-domain 與 gamma=2.2 前處理。</p>
+<h3>7.1 TMQI 專用輸入</h3>
+<p>先將參考裁切到合法範圍，再轉 float64。r_min／r_max 是參考最小／最大值：</p>
+<pre>k = round((2^32 − 1) / (r_max − r_min))
+H0 = k × (R − r_min)
+L0 = float64(D)</pre>
+<p>實作是<strong>先對倍率取整數，再乘差值</strong>。H0 約涵蓋 0..2^32−1，L0 保留 0..255。參考全為常數時分母為零，顯示 N/A。</p>
+<h3>7.2 單尺度的局部結構相似度</h3>
+<p>對目前尺度的 H、L，以 11×11、σ=1.5、總和為 1 的 Gaussian kernel Wg 做 valid 卷積，只取 kernel 完整落在影像內的位置，不補邊：</p>
+<pre>μ_H = Wg * H                     μ_L = Wg * L
+σ_H = sqrt(max(Wg * H² − μ_H², 0))
+σ_L = sqrt(max(Wg * L² − μ_L², 0))
+σ_HL = Wg * (H × L) − μ_H × μ_L</pre>
+<p>* 表示卷積，× 表示對應位置相乘。σ_HL 是局部共變異量。接著用空間頻率 sf 的對比敏感度 CSF 將標準差轉成可見程度：</p>
+<pre>CSF(sf) = 100 × 2.6 × (0.0192 + 0.114 × sf) × exp(−(0.114 × sf)^1.1)
+u = 128 / (1.4 × CSF(sf))
+s = u / 3
+p_H = Φ((σ_H − u) / s)
+p_L = Φ((σ_L − u) / s)</pre>
+<p>Φ 是標準常態累積分布函數；兩張圖使用相同 u、s。以 C1=0.01、C2=10 計算相似度圖並平均：</p>
+<pre>S_map = [(2 × p_H × p_L + 0.01) / (p_H² + p_L² + 0.01)]
+        × [(σ_HL + 10) / (σ_H × σ_L + 10)]
+S_i = mean(S_map)</pre>
+<p>第一部分比較局部對比是否可見，第二部分衡量結構是否對應；並非要求每個像素 DN 相同。</p>
+<h3>7.3 合成五尺度結構保真度 S</h3>
+<p>第一尺度用完整影像。每次計算後做 2×2 均值濾波（係數皆為 1/4），使用對稱補邊與 same 輸出，再以 [::2, ::2] 每隔一個像素取樣。寬高各約減半，不是各縮小四倍。</p>
+<table><tr><th>尺度</th><th>相對寬高</th><th>sf</th><th>權重</th></tr>
+<tr><td>1</td><td>1</td><td>16</td><td>0.0448</td></tr><tr><td>2</td><td>約 1/2</td><td>8</td><td>0.2856</td></tr>
+<tr><td>3</td><td>約 1/4</td><td>4</td><td>0.3001</td></tr><tr><td>4</td><td>約 1/8</td><td>2</td><td>0.2363</td></tr>
+<tr><td>5</td><td>約 1/16</td><td>1</td><td>0.1333</td></tr></table>
+<pre>S = S_1^0.0448 × S_2^0.2856 × S_3^0.3001 × S_4^0.2363 × S_5^0.1333</pre>
+<p>這是加權乘積，不是算術平均；權重按參考程式直接使用，不另做正規化。最小邊長 161 經四次取樣為 161 → 81 → 41 → 21 → 11，最後仍能放入 11×11 kernel，因此寬高皆要求至少 161。</p>
+<h3>7.4 統計自然度 N_nat</h3>
+<p>只使用原解析度的 D。先算平均亮度 m，再以<strong>不重疊的 11×11 方塊</strong>計算對比統計 b：</p>
+<ol><li>右側、下側以 0 補齊方塊。參考程式在尺寸整除 11 時仍多補一塊，但最後會裁回原尺寸。</li><li>每塊算樣本標準差（ddof=1，分母 121−1），並填滿該塊。</li><li>裁回原尺寸，對標準差圖取平均得到 b。邊緣不完整方塊會受補零影響。</li></ol>
+<p>亮度項 p_b 使用常態分布並除以峰值：</p>
+<pre>m = mean(D)
+p_b = exp(−(m − 115.94)² / (2 × 27.99²))</pre>
+<p>對比項 p_c 使用 Beta 分布（α=4.4、β=10.1），再除以其峰值：</p>
+<pre>x = b / 64.29
+x_mode = (4.4 − 1) / (4.4 + 10.1 − 2) = 0.272
+p_c = BetaPDF(x; 4.4, 10.1) / BetaPDF(0.272; 4.4, 10.1)
+N_nat = p_b × p_c</pre>
+<p>BetaPDF(x; α, β) = x^(α−1)(1−x)^(β−1) / B(α, β)，定義域為 0..1，超出則為 0；比值中的正規化常數 B 會相消。此模型不是亮度、對比越大越好，而是越接近它偏好的統計時分數越高。</p>
+<h3>7.5 最終 TMQI</h3>
+<pre>TMQI = 0.8012 × S^0.3046 + 0.1988 × N_nat^0.7088</pre>
+<div class="example">若 S=0.9、N_nat=0.5，代入得到 TMQI 約 <strong>0.89753</strong>。此為合成公式的示例，不是某張測試影像的結果。</div>
+<p>正常有效結果為 0..1、越高越好，但沒有通用及格門檻。程式保留有限結果，不額外裁切到 0..1；無法產生有限實數時顯示 N/A。自然度模型有領域偏好，因此熱影像仍應搭配實際用途判斷。</p>
+
+<h2 id="na">8. N/A、顯示精度與匯出</h2>
+<table><tr><th>情況</th><th>結果</th></tr>
+<tr><td>沒有參考影像</td><td>Gradient／Entropy 正常；C_global、C_local、TMQI 為 N/A。</td></tr>
+<tr><td>寬或高小於 161</td><td>TMQI 為 N/A；有參考時對比損失仍可計算，不自動放大影像或減少尺度。</td></tr>
+<tr><td>參考為常數</td><td>TMQI 為 N/A；其他指標照公式計算。</td></tr>
+<tr><td>TMQI 無法產生有限實數</td><td>顯示 N/A，例如不適用的結構關係造成非實數次方，不以 0 分代替。</td></tr>
+<tr><td>輸入非空灰階條件不成立、含 NaN／Inf、參考尺寸不一致或範圍上限不合法</td><td>回報輸入錯誤，不產生有效評分。</td></tr>
+<tr><td>尚未分析</td><td>顯示 --，和已分析但不適用的 N/A 不同。</td></tr></table>
+<ul>
+<li>畫面顯示小數點後 5 位，較佳值也依顯示精度判斷；顯示相同就不特別標色。Gradient／Entropy／TMQI 取較大者，C_global／C_local 取較小者。N/A 不參與比較。</li>
+<li>JSON 保留計算數值，N/A 為 null，並附 unavailable_reasons；文字摘要也會附原因。Excel 留空表示 N/A，Definitions 提供說明；五項指標各有自己的圖表。</li>
+<li>gradient 圖片使用 round(G × 255) 裁切至 0..255，供視覺檢查。Gradient 數值取自未量化的 G，不是從匯出 PNG 重算。</li>
+<li>以完整解析度評估，不額外降採樣；TMQI 的五尺度取樣屬於指標本身。預覽不寫檔，Save 才儲存。</li>
+</ul>
+<h2>9. 對照程式位置</h2>
+<table><tr><th>檔案</th><th>內容</th></tr>
+<tr><td><code>thermal_toolkit/analysis/quality/fieldscale_iqa.py</code></td><td>Gradient、Entropy、對比前處理與損失、N/A 條件</td></tr>
+<tr><td><code>thermal_toolkit/analysis/quality/tmqi_reference.py</code></td><td>TMQI 結構相似度、五尺度與自然度模型</td></tr>
+<tr><td><code>thermal_toolkit/algorithms/mapping.py</code></td><td>固定全位深轉 8-bit</td></tr></table>
+<p>不同工具的結果比較前，請確認位深、正規化、kernel、邊界、gamma 和參考配對方式一致。本頁描述目前實作，不宣稱逐值重現 Fieldscale 的論文表格。</p>
+</body></html>

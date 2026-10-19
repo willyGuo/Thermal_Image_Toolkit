@@ -1,0 +1,52 @@
+{
+  "bad_pixel_calibration": {
+    "dc_sigma": 5.0,
+    "response_percent": 5.0,
+    "netd_sigma": 5.0,
+    "window": 9
+  },
+  "weighted_mapping": {
+    "enabled": false,
+    "range_thl": 25.0,
+    "range_thh": 412.0,
+    "sigma_thl": 5.5,
+    "sigma_thh": 71.9,
+    "ratio_mode": "max",
+    "parameter_mode": "single",
+    "relative_range_thl": 0.016,
+    "relative_range_thh": 0.018
+  },
+  "log_font_size": 17,
+  "raw_input": {
+    "resolution": [
+      640,
+      512
+    ],
+    "bit_depth": 14,
+    "output_root": "D:\\01_Project\\02_Loewe\\08_Tool\\Thermal_Image_Toolkit\\Thermal_RAW_Results"
+  },
+  "timeline": {
+    "metric": "overall_score",
+    "history_seconds": 60,
+    "raw_histogram_show_cdf": false
+  },
+  "camera_mirror": {
+    "camera_a": true,
+    "camera_b": false
+  },
+  "quality_weights": {
+    "spatial": {
+      "detail_clarity_score": 22,
+      "contrast_quality_score": 18,
+      "flat_cleanliness_score": 18,
+      "thermal_uniformity_score": 16,
+      "clipping_control_score": 10,
+      "artifact_control_score": 16
+    },
+    "uvc_temporal": {
+      "spatial_quality_score": 70,
+      "flicker_control_score": 15,
+      "temporal_stability_score": 15
+    }
+  }
+}
