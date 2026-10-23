@@ -13,6 +13,15 @@ python main.py
 
 ## 程式結構
 
+`NUC Calculate` 的 `N (K fractional bits)` 可選 0～15，預設 8。
+K 以 uint16 little-endian 儲存，實際增益為 `K / 2^N`：N=8 產生 Q8（1 倍為 256），
+N=14 產生 Q14（1 倍為 16384）。B 為 signed int16 little-endian DN，計算、校正預覽與
+`high_nuc_corrected.raw` 都使用所選 N：`clip((K * (Input - B)) >> N, 0, Bit Depth Max)`。
+K 超過 65535 時沿用裁切處理，介面顯示增益上限，`nuc_summary.txt` 記錄 N、格式與裁切像素數；
+Q14 最大增益約 3.99994。無效像素使用 K=`2^N`、B=0。
+載入產生的 `pointN_K.bin`／`pointN_B.bin` 至 `NUC_Analyze` 時，須設定相同 N；
+BIN 本身不含 Q 格式資訊。板端也須使用對應的 shift 與 K 格式。
+
 `Calibration > Bad pixel calibration` uses DC Level, Responsivity and optional NETD.
 DC-only needs RAW A; B and temperatures are not required. Responsivity needs A/B;
 NETD additionally needs temperatures and a temporal folder. Unused inputs are disabled.

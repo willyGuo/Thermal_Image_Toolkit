@@ -2,7 +2,7 @@
 
 import numpy as np
 import os
-from thermal_toolkit.core.constants import NOVATEK_NUC_GAIN_ONE, NOVATEK_NUC_GAIN_SHIFT
+from thermal_toolkit.core.constants import NOVATEK_NUC_GAIN_SHIFT
 
 
 def calculate_nuc(low, high, min_delta):
@@ -21,19 +21,23 @@ def calculate_nuc(low, high, min_delta):
     return gain, offset, valid, pixel_delta, low_avg, high_avg
 
 
-def convert_additive_b_to_gfx_b(old_b, stored_k):
+def convert_additive_b_to_gfx_b(old_b, stored_k, gain_shift=NOVATEK_NUC_GAIN_SHIFT):
     old_b_i64 = np.asarray(old_b, dtype=np.int64)
     stored_k_i64 = np.asarray(stored_k, dtype=np.int64)
     gfx_b = np.zeros(old_b_i64.shape, dtype=np.int64)
     nonzero = stored_k_i64 != 0
-    numerator = -(old_b_i64[nonzero] * NOVATEK_NUC_GAIN_ONE)
+    numerator = -(old_b_i64[nonzero] * (1 << gain_shift))
     denominator = stored_k_i64[nonzero]
     rounded = (np.abs(numerator) + denominator // 2) // denominator
     gfx_b[nonzero] = np.where(numerator < 0, -rounded, rounded)
     return np.clip(gfx_b, -32768, 32767).astype(np.int16)
 
 
-def build_novatek_nuc_tables(low, high, min_delta):
+def build_novatek_nuc_tables(low, high, min_delta, gain_shift=NOVATEK_NUC_GAIN_SHIFT):
+    """Build uint16 QN K and int16 B, preserving legacy Q8 integer rounding."""
+    if not isinstance(gain_shift, (int, np.integer)) or not 0 <= gain_shift <= 15:
+        raise ValueError("NUC N must be an integer from 0 to 15 for uint16 K (including unity gain).")
+    gain_shift = int(gain_shift)
     low_i64 = np.asarray(low, dtype=np.int64)
     high_i64 = np.asarray(high, dtype=np.int64)
     pixel_count = low_i64.size
@@ -47,19 +51,19 @@ def build_novatek_nuc_tables(low, high, min_delta):
 
     pixel_delta = high_i64 - low_i64
     valid = pixel_delta > min_delta
-    stored_k_i64 = np.full(low_i64.shape, NOVATEK_NUC_GAIN_ONE, dtype=np.int64)
+    stored_k_i64 = np.full(low_i64.shape, 1 << gain_shift, dtype=np.int64)
     raw_k = np.zeros(low_i64.shape, dtype=np.int64)
-    raw_k[valid] = (target_delta << NOVATEK_NUC_GAIN_SHIFT) // pixel_delta[valid]
+    raw_k[valid] = (target_delta << gain_shift) // pixel_delta[valid]
     table_valid = valid & (raw_k > 0)
     stored_k_i64[table_valid] = np.clip(raw_k[table_valid], 1, 65535)
 
     old_b = np.zeros(low_i64.shape, dtype=np.int64)
     old_b[table_valid] = low_avg - (
-        (stored_k_i64[table_valid] * low_i64[table_valid]) >> NOVATEK_NUC_GAIN_SHIFT
+        (stored_k_i64[table_valid] * low_i64[table_valid]) >> gain_shift
     )
     gfx_b = np.zeros(low_i64.shape, dtype=np.int16)
     gfx_b[table_valid] = convert_additive_b_to_gfx_b(
-        old_b[table_valid], stored_k_i64[table_valid]
+        old_b[table_valid], stored_k_i64[table_valid], gain_shift
     )
     stored_k = stored_k_i64.astype(np.uint16)
     return stored_k, gfx_b, table_valid, low_avg, high_avg

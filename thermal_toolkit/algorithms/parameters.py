@@ -43,12 +43,22 @@ TONE_MAPPING_OPTIONS = [
     ("Linear Full Range", "linear"),
     ("Percentile", "percentile"),
     ("Histogram-weighted mapping", "histogram_weighted"),
+    ("Effective-range Weighted / Double Plateau", "weighted_plateau"),
     ("CLAHE Tone Mapping", "clahe"),
     ("Fieldscale Local Adaptive AGC", "fieldscale"),
 ]
 
 
 DEFAULT_TONE_MAPPING_PARAMETERS = {
+    "weighted_plateau": {
+        "plateau_low_percentile": 0.0,
+        "plateau_high_percentile": 100.0,
+        "plateau_mode": "double_plateau",
+        "plateau_upper": 1.0,
+        "plateau_lower": 0.1,
+        "plateau_redistribute": False,
+        "plateau_gain_limit": 0.0,
+    },
     "linear": {"black_dn": 0, "white_dn": 16383},
     "percentile": {"low_percentile": 1.0, "high_percentile": 99.0, "percentile_gain_limit": 0.0},
     "histogram_weighted": {

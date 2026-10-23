@@ -26,10 +26,34 @@ class NucCalculationPageMixin:
         self.low_folder = PathRow("folder", dialog_title="Select LOW RAW Folder for NUC")
         self.high_folder = PathRow("folder", dialog_title="Select HIGH RAW Folder for NUC")
         self.min_delta = FocusWheelSpinBox(); self.min_delta.setRange(0, 16383); self.min_delta.setValue(50)
+        self.nuc_calculate_gain_shift = FocusWheelSpinBox()
+        self.nuc_calculate_gain_shift.setRange(0, 15)
+        self.nuc_calculate_gain_shift.setValue(NOVATEK_NUC_GAIN_SHIFT)
+        self.nuc_calculate_gain_shift.setToolTip(
+            "K uses N fractional bits: N=8 is Q8, N=14 is Q14. "
+            "Use the same N in NUC_Analyze and the target correction. "
+            "N is limited to 15 so uint16 K can represent unity gain for invalid pixels."
+        )
         f.addRow("NUC Point", self.nuc_point_combo); f.addRow("NUC Source Mode", self.nuc_mode); f.addRow("LOW RAW", self.low_single); f.addRow("HIGH RAW", self.high_single); f.addRow("LOW Folder", self.low_folder); f.addRow("HIGH Folder", self.high_folder); f.addRow("Min Delta DN", self.min_delta)
+        f.addRow("N (K fractional bits)", self.nuc_calculate_gain_shift)
+        self.nuc_calculate_format = QLabel()
+        self.nuc_calculate_format.setWordWrap(True)
+        f.addRow(self.nuc_calculate_format)
+        self.nuc_calculate_gain_shift.valueChanged.connect(self.update_nuc_calculate_format)
+        self.update_nuc_calculate_format()
         note = QLabel("Recommended: capture multiple frames at each stable blackbody temperature, average each folder pixel-by-pixel, then calculate NUC Gain/Offset and Novatek K/B tables.")
         note.setWordWrap(True); note.setStyleSheet("color:#c98;"); f.addRow(note)
         self.stack.addWidget(p); self.update_nuc_mode()
+
+    def update_nuc_calculate_format(self):
+        n = self.nuc_calculate_gain_shift.value()
+        self.nuc_calculate_format.setText(
+            f"K: uint16 Q{n}, gain = K / {1 << n}; unity K = {1 << n}.\n"
+            f"Maximum gain: {65535 / (1 << n):.8f}; larger K is clipped to 65535. "
+            "B: signed int16 DN.\n"
+            f"Output = clip((K * (Input - B)) >> {n}, 0, Bit Depth Max). "
+            f"Set NUC_Analyze N to {n} for these tables."
+        )
 
     def update_nuc_mode(self):
         folder_mode = self.nuc_mode.currentIndex() == 0
@@ -46,12 +70,16 @@ class NucCalculationPageMixin:
         return low, high, [self.low_single.text()], [self.high_single.text()], [], []
 
     def run_nuc_calculate(self):
+        n = self.nuc_calculate_gain_shift.value()
         low, high, low_files, high_files, low_skip, high_skip = self._get_nuc_inputs()
         gain, offset, valid, delta, low_avg, high_avg = calculate_nuc(low, high, self.min_delta.value())
         stored_k, gfx_b, table_valid, novatek_low_avg, novatek_high_avg = build_novatek_nuc_tables(
-            low, high, self.min_delta.value()
+            low, high, self.min_delta.value(), n
         )
         valid = table_valid
+        saturated_k_count = int(np.count_nonzero(
+            ((novatek_high_avg - novatek_low_avg) << n) // delta[valid].astype(np.int64) > 65535
+        ))
         point_number = self.nuc_point_combo.currentData()
         out = self.make_output("nuc_calculate")
         low.astype(RAW_DTYPE).tofile(out / "low_input_used.raw"); high.astype(RAW_DTYPE).tofile(out / "high_input_used.raw")
@@ -71,15 +99,17 @@ class NucCalculationPageMixin:
             f.write(f"Min delta: {self.min_delta.value()}\nValid pixels: {valid.sum()} / {valid.size}\n")
             if valid.any(): f.write(f"Gain mean/std: {gain[valid].mean():.8f} / {gain[valid].std():.8f}\nOffset mean/std: {offset[valid].mean():.4f} / {offset[valid].std():.4f}\n")
             f.write(f"Novatek integer LOW/HIGH mean: {novatek_low_avg} / {novatek_high_avg}\n")
-            f.write(f"K format: uint16 Q8; B format: signed int16\n")
-            f.write(f"Runtime formula: output = (K * (input - B)) >> {NOVATEK_NUC_GAIN_SHIFT}\n")
+            f.write(f"N: {n}\nK format: uint16 little-endian Q{n}; gain = K / {1 << n}; unity K = {1 << n}\nB format: signed int16 little-endian DN\n")
+            f.write(f"Maximum gain: {65535 / (1 << n):.8f}\nK clipped to 65535 pixels: {saturated_k_count}\n")
+            f.write(f"Runtime formula: output = clip((K * (input - B)) >> {n}, 0, {self.raw_max})\n")
+            f.write(f"NUC_Analyze N: {n}\n")
             f.write(f"K file: {k_path.name} ({k_path.stat().st_size} bytes)\n")
             f.write(f"B file: {b_path.name} ({b_path.stat().st_size} bytes)\n")
         low_preview = raw_to_display_u8(low, self.raw_max)
         high_preview = raw_to_display_u8(high, self.raw_max)
         save_png(out / "low_preview.png", low_preview); save_png(out / "high_preview.png", high_preview)
         # Preview the same quantized K/B formula used by the Novatek GFX path.
-        corrected_high = apply_novatek_nuc(high, stored_k, gfx_b, self.raw_max)
+        corrected_high = apply_novatek_nuc(high, stored_k, gfx_b, self.raw_max, n)
         corrected_high_preview = raw_to_display_u8(corrected_high, self.raw_max)
         corrected_high.astype(RAW_DTYPE).tofile(out / "high_nuc_corrected.raw")
         save_png(out / "high_nuc_corrected_preview.png", corrected_high_preview)
@@ -87,6 +117,8 @@ class NucCalculationPageMixin:
         self.preview_original.set_array(high_preview)
         self.preview_result.set_array(corrected_high_preview)
         self.log.append(f"Novatek NUC point={point_number}: {k_path.name}, {b_path.name}")
+        self.log.append(f"K=uint16 Q{n}, N={n}, unity K={1 << n}; use N={n} in NUC_Analyze")
+        self.log.append(f"K clipped to 65535 pixels: {saturated_k_count:,}")
         self.log.append(f"Mode: {self.nuc_mode.currentText()}")
         self.log.append(f"LOW frames={len(low_files)}, HIGH frames={len(high_files)}, invalid/skipped={len(low_skip)+len(high_skip)}")
         self.log.append(f"Low mean={low_avg:.3f}, High mean={high_avg:.3f}, Target delta={high_avg-low_avg:.3f}")

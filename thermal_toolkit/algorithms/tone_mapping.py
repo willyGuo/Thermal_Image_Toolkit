@@ -10,6 +10,7 @@ from thermal_toolkit.algorithms.parameters import DEFAULT_TONE_MAPPING_PARAMETER
 from thermal_toolkit.core.opencv import cv2
 from thermal_toolkit.algorithms.weighted_grid import histogram_weighted_grid_u8
 from thermal_toolkit.algorithms import weighted_aci
+from thermal_toolkit.algorithms.weighted_plateau import effective_weighted_plateau_u8
 
 
 def tone_mapping_parameters(method, parameters=None, input_max=255):
@@ -71,6 +72,37 @@ def apply_tone_mapping(
             "preserve lower-median brightness; no rescaling; round to 8-bit"
             if gain_info["gain_limit"] else "; Gain Limit=Off"
         )
+    elif method == "weighted_plateau":
+        mapped, plateau_info = effective_weighted_plateau_u8(image, input_max, **params)
+        calculated.update(plateau_info)
+        label = "Double Plateau" if params["plateau_mode"] == "double_plateau" else "Weighted"
+        details = (
+            f"Effective-range global {label}: "
+            f"P{params['plateau_low_percentile']:g}/P{params['plateau_high_percentile']:g} -> "
+            f"DN {plateau_info['mapping_first_dn']}..{plateau_info['mapping_last_dn']}; "
+            f"Unique Levels={plateau_info['unique_levels']}; "
+            f"average={plateau_info['histogram_average_count']:.3f} px/populated bin\n"
+            f"Upper={params['plateau_upper']:g} x average -> {plateau_info['upper_plateau_count']} px/bin; "
+            f"Lower={'Off' if params['plateau_mode'] == 'weighted' else format(params['plateau_lower'], 'g') + ' x average'}"
+            f" -> {plateau_info['lower_plateau_count']} px/bin\n"
+            f"Redistribution={'effective populated bins only' if params['plateau_redistribute'] else 'Off'}; "
+            f"clipped={plateau_info['clipped_histogram_count']:,}; "
+            f"redistributed={plateau_info['redistributed_histogram_count']:,}; "
+            f"discarded={plateau_info['discarded_histogram_count']:,}; "
+            f"floor added={plateau_info['floor_added_histogram_count']:,}\n"
+            "W(i)=H(i)+H(i+1); cumulative normalized mapping; no allocation outside effective range."
+        )
+        if plateau_info['constant_effective_range']:
+            details += " Constant effective range: output 128."
+        if plateau_info['gain_limit']:
+            details += (
+                f"\nLUT Gain Limit={plateau_info['gain_limit']:g} Gray/DN; "
+                f"anchor DN {plateau_info['gain_anchor_dn']} -> {plateau_info['gain_anchor_gray']}; "
+                "preserve percentile-clamped lower-median brightness; no rescaling; "
+                "fractional limits apply before 8-bit rounding."
+            )
+        else:
+            details += "\nLUT Gain Limit=Off"
     elif method == "histogram_weighted":
         clip_limit = float(params["histogram_weighted_clip"])
         redistribute = bool(params["histogram_weighted_redistribute"])
