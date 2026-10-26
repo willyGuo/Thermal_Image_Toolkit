@@ -43,7 +43,7 @@ TONE_MAPPING_OPTIONS = [
     ("Linear Full Range", "linear"),
     ("Percentile", "percentile"),
     ("Histogram-weighted mapping", "histogram_weighted"),
-    ("Effective-range Weighted / Double Plateau", "weighted_plateau"),
+    ("Double Plateau", "weighted_plateau"),
     ("CLAHE Tone Mapping", "clahe"),
     ("Fieldscale Local Adaptive AGC", "fieldscale"),
 ]
@@ -51,13 +51,13 @@ TONE_MAPPING_OPTIONS = [
 
 DEFAULT_TONE_MAPPING_PARAMETERS = {
     "weighted_plateau": {
-        "plateau_low_percentile": 0.0,
-        "plateau_high_percentile": 100.0,
-        "plateau_mode": "double_plateau",
+        "plateau_weight_mode": "adjacent",
         "plateau_upper": 1.0,
-        "plateau_lower": 0.1,
+        "plateau_lower": 0.3,
         "plateau_redistribute": False,
-        "plateau_gain_limit": 0.0,
+        "plateau_gain_limit": 2.0,
+        "plateau_bright_weight": 1.0,
+        "plateau_bright_percentile": 80.0,
     },
     "linear": {"black_dn": 0, "white_dn": 16383},
     "percentile": {"low_percentile": 1.0, "high_percentile": 99.0, "percentile_gain_limit": 0.0},
@@ -67,7 +67,7 @@ DEFAULT_TONE_MAPPING_PARAMETERS = {
         "histogram_weighted_redistribute": True,
         "histogram_weighted_bright_weight": 1.0,
         "histogram_weighted_bright_percentile": 80.0,
-        "histogram_weighted_gain_limit": 0,
+        "histogram_weighted_gain_limit": 2.0,
     },
     "clahe": {"clahe_clip": 2.0, "clahe_grid": 8},
     "fieldscale": {
@@ -141,7 +141,9 @@ IMAGE_ALGORITHM_DESCRIPTIONS = {
 
 
 DEFAULT_ALGORITHM_PARAMETERS = {
-    "histogram_weighted": dict(DEFAULT_TONE_MAPPING_PARAMETERS["histogram_weighted"]),
+    # Enhancement receives 8-bit gray levels; preserve its existing Gain Limit default.
+    "histogram_weighted": dict(DEFAULT_TONE_MAPPING_PARAMETERS["histogram_weighted"],
+                               histogram_weighted_gain_limit=0),
     "auto_contrast": dict(DEFAULT_TONE_MAPPING_PARAMETERS["percentile"]),
     "fieldscale": {
         "grid_count": 8,

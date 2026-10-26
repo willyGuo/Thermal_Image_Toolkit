@@ -94,7 +94,8 @@ class WeightedAciTests(unittest.TestCase):
         source = np.block([[tile, tile + 1000], [tile + 2000, tile + 3000]])
         actual, details, calculated, parameters = apply_tone_mapping(
             source, 'histogram_weighted', 16383, {'histogram_weighted_grid': 2})
-        expected, info = histogram_weighted_grid_u8(source, 16383, grid=2)
+        expected, info = histogram_weighted_grid_u8(
+            source, 16383, grid=2, gain_limit=parameters['histogram_weighted_gain_limit'])
         np.testing.assert_array_equal(actual, expected)
         self.assertEqual(calculated['tiles'], info['tiles'])
         for tile_info, mean in zip(info['tiles'], (200, 1200, 2200, 3200)):
@@ -124,7 +125,7 @@ class WeightedAciTests(unittest.TestCase):
 
     def test_grid_and_tone_mapping_share_automatic_clip(self):
         source = np.tile(np.arange(1000, 1400, dtype=np.uint16), (10, 1))
-        output, info = histogram_weighted_grid_u8(source, 16383, grid=2)
+        output, info = histogram_weighted_grid_u8(source, 16383, grid=2, gain_limit=2)
         actual, details, calculated, _ = apply_tone_mapping(
             source, 'histogram_weighted', 16383, {'histogram_weighted_grid': 2})
         np.testing.assert_array_equal(actual, output)

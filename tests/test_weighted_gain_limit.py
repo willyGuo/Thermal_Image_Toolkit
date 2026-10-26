@@ -40,9 +40,12 @@ class WeightedGainLimitTests(unittest.TestCase):
                     self.assertEqual(info["gain_anchor_dn"], 8000)
                     self.assertEqual(info["gain_anchor_gray"], 128)
 
-    def test_old_parameters_default_to_off(self):
+    def test_tone_default_gain_two_and_explicit_off(self):
         parameters = tone_mapping_parameters("histogram_weighted")
-        self.assertEqual(parameters.pop("histogram_weighted_gain_limit"), 0)
+        self.assertEqual(parameters["histogram_weighted_gain_limit"], 2)
+        output, _, _, _ = apply_tone_mapping(self.example, "histogram_weighted", 16383)
+        self.assertEqual(np.unique(output).tolist(), [124, 126, 128, 130, 132])
+        parameters["histogram_weighted_gain_limit"] = 0
         output, _, _, used = apply_tone_mapping(
             self.example, "histogram_weighted", 16383, parameters
         )

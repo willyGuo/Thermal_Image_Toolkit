@@ -219,28 +219,15 @@ class ImageAlgorithmPageMixin:
             "border-radius:5px; padding:7px;"
         )
         self.tone_mapping_reset = QPushButton("Reset Mapping Parameters")
-        self.tone_plateau_mode = FocusWheelComboBox()
-        self.tone_plateau_mode.addItem("Weighted (Upper Plateau Only)", "weighted")
-        self.tone_plateau_mode.addItem("Double Plateau (Upper + Lower)", "double_plateau")
-        self.tone_plateau_mode.setCurrentIndex(1)
-        self.tone_plateau_mode.setToolTip(
-            "Global adjacent-bin weighted mapping. Double Plateau additionally raises "
-            "low-count populated bins to the lower threshold to retain their gray-level allocation."
+        self.tone_plateau_weight_mode = FocusWheelComboBox()
+        self.tone_plateau_weight_mode.addItem("Adjacent Bins: H'(i) + H'(i+1)", "adjacent")
+        self.tone_plateau_weight_mode.addItem("Single Bin: H'(i)", "single")
+        self.tone_plateau_weight_mode.setToolTip(
+            "Choose the weight of each native-DN interval i to i+1 after plateau processing. "
+            "Single Bin uses only the left bin H'(i), without H'(i+1). "
+            "Both modes normalize over the observed input range after optional Bright Weight "
+            "and before Gain Limit; this is interval weighting, not an inclusive HE CDF."
         )
-        self.tone_plateau_low_percentile = FocusWheelDoubleSpinBox()
-        self.tone_plateau_high_percentile = FocusWheelDoubleSpinBox()
-        for widget, low, high, default in (
-            (self.tone_plateau_low_percentile, 0.0, 99.5, 0.0),
-            (self.tone_plateau_high_percentile, 0.5, 100.0, 100.0),
-        ):
-            widget.setRange(low, high)
-            widget.setDecimals(1)
-            widget.setSingleStep(0.5)
-            widget.setValue(default)
-            widget.setToolTip(
-                "Select the effective range from original input percentiles. P0/P100 uses "
-                "the observed minimum/maximum. Values outside the selected range map to its endpoints."
-            )
         self.tone_plateau_upper = FocusWheelDoubleSpinBox()
         self.tone_plateau_lower = FocusWheelDoubleSpinBox()
         for widget, low, high, default in (
@@ -252,10 +239,10 @@ class ImageAlgorithmPageMixin:
             widget.setSingleStep(0.05)
             widget.setValue(default)
             widget.setToolTip(
-                "Multiplier of pixel count / populated levels in the percentile-clamped image. "
+                "Multiplier of pixel count / populated levels in the original input. "
                 "Counts round half up. Lower must not exceed Upper; 0 disables the lower floor."
             )
-        self.tone_plateau_redistribute = QualityScoreCheckBox("Redistribute Within Effective Populated Bins")
+        self.tone_plateau_redistribute = QualityScoreCheckBox("Redistribute Within Populated Bins")
         self.tone_plateau_redistribute.setChecked(False)
         self.tone_plateau_redistribute.setToolTip(
             "Redistribute upper-clipped counts only into originally populated bins below "
@@ -269,15 +256,31 @@ class ImageAlgorithmPageMixin:
         self.tone_plateau_gain_limit.setSpecialValueText("0.0 (Off)")
         self.tone_plateau_gain_limit.setToolTip(
             "Limit the final LUT increase per native DN after plateau mapping. "
-            "Preserve the percentile-clamped lower-median DN's output brightness; "
+            "Preserve the original lower-median DN's output brightness; "
             "do not stretch again. 0.0 disables the limit. Fractional limits accumulate "
             "before 8-bit rounding. Start with 0.2 Gray/DN for uniform blackbody images."
         )
+        self.tone_plateau_bright_percentile = FocusWheelDoubleSpinBox()
+        self.tone_plateau_bright_percentile.setRange(0.0, 100.0)
+        self.tone_plateau_bright_percentile.setDecimals(1)
+        self.tone_plateau_bright_percentile.setSingleStep(1.0)
+        self.tone_plateau_bright_percentile.setValue(80.0)
+        self.tone_plateau_bright_percentile.setToolTip(
+            "Percentile of the original input before "
+            "plateau processing or weighting. Interval midpoints at/above this DN receive Bright Weight."
+        )
+        self.tone_plateau_bright_weight = FocusWheelComboBox()
+        for weight in (1.0, 1.05, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0):
+            self.tone_plateau_bright_weight.addItem("1 (Off)" if weight == 1.0 else f"{weight:g}", weight)
+        self.tone_plateau_bright_weight.setToolTip(
+            "Multiply bright interval weights after plateau processing, then renormalize "
+            "over the observed input range before Gain Limit. 1 preserves the unweighted mapping."
+        )
         self.tone_mapping_parameter_widgets = {
+            "plateau_bright_weight": self.tone_plateau_bright_weight,
+            "plateau_bright_percentile": self.tone_plateau_bright_percentile,
             "plateau_gain_limit": self.tone_plateau_gain_limit,
-            "plateau_mode": self.tone_plateau_mode,
-            "plateau_low_percentile": self.tone_plateau_low_percentile,
-            "plateau_high_percentile": self.tone_plateau_high_percentile,
+            "plateau_weight_mode": self.tone_plateau_weight_mode,
             "plateau_upper": self.tone_plateau_upper,
             "plateau_lower": self.tone_plateau_lower,
             "plateau_redistribute": self.tone_plateau_redistribute,
@@ -301,14 +304,25 @@ class ImageAlgorithmPageMixin:
             "message_passing_iterations": self.tone_fieldscale_message_iterations,
             "max_local_gain": self.tone_fieldscale_max_local_gain,
         }
+        # Initialize from the same defaults used by Reset and library Tone Mapping.
+        # Signals are connected below, after all parameter controls are ready.
+        for mapping_key in ("histogram_weighted", "weighted_plateau"):
+            for key, value in DEFAULT_TONE_MAPPING_PARAMETERS[mapping_key].items():
+                widget = self.tone_mapping_parameter_widgets[key]
+                if isinstance(widget, QCheckBox):
+                    widget.setChecked(bool(value))
+                elif isinstance(widget, QComboBox):
+                    widget.setCurrentIndex(max(0, widget.findData(value)))
+                else:
+                    widget.setValue(value)
         self.tone_mapping_parameter_rows = {}
         for label, key in (
-            ("Effective-range Mapping Mode", "plateau_mode"),
-            ("Effective Range Low Percentile", "plateau_low_percentile"),
-            ("Effective Range High Percentile", "plateau_high_percentile"),
+            ("Histogram Interval Weight", "plateau_weight_mode"),
             ("Upper Plateau (x Populated-bin Average)", "plateau_upper"),
             ("Lower Plateau (x Populated-bin Average)", "plateau_lower"),
-            ("Effective-range Redistribution", "plateau_redistribute"),
+            ("Redistribution", "plateau_redistribute"),
+            ("Bright Threshold Percentile", "plateau_bright_percentile"),
+            ("Bright Weight", "plateau_bright_weight"),
             ("Gain Limit (Gray / DN)", "plateau_gain_limit"),
             ("Black DN", "black_dn"),
             ("White DN", "white_dn"),
@@ -426,11 +440,10 @@ class ImageAlgorithmPageMixin:
         )
         for widget in (
             self.tone_black_dn,
-            self.tone_plateau_low_percentile,
-            self.tone_plateau_high_percentile,
             self.tone_plateau_upper,
             self.tone_plateau_lower,
             self.tone_plateau_gain_limit,
+            self.tone_plateau_bright_percentile,
             self.tone_white_dn,
             self.tone_low_percentile,
             self.tone_high_percentile,
@@ -448,7 +461,8 @@ class ImageAlgorithmPageMixin:
             widget.valueChanged.connect(self.update_raw_pipeline_ui)
         self.tone_histogram_weighted_redistribute.toggled.connect(self.update_raw_pipeline_ui)
         self.tone_plateau_redistribute.toggled.connect(self.update_raw_pipeline_ui)
-        self.tone_plateau_mode.currentIndexChanged.connect(self.update_raw_pipeline_ui)
+        self.tone_plateau_weight_mode.currentIndexChanged.connect(self.update_raw_pipeline_ui)
+        self.tone_plateau_bright_weight.currentIndexChanged.connect(self.update_raw_pipeline_ui)
         self.tone_histogram_weighted_bright_weight.currentIndexChanged.connect(
             self.update_raw_pipeline_ui
         )
@@ -584,8 +598,8 @@ class ImageAlgorithmPageMixin:
         }.get(method, set())
         for key, row in self.tone_mapping_parameter_rows.items():
             self.tone_mapping_parameter_group.set_body_widget_visible(row, key in visible_keys)
-        self.tone_mapping_parameter_rows["plateau_lower"].setEnabled(
-            self.tone_plateau_mode.currentData() == "double_plateau"
+        self.tone_mapping_parameter_rows["plateau_bright_percentile"].setEnabled(
+            self.tone_plateau_bright_weight.currentData() != 1.0
         )
         fieldscale_local_controls_enabled = (
             self.tone_fieldscale_grid.currentData() != 1
@@ -605,14 +619,17 @@ class ImageAlgorithmPageMixin:
         )
         descriptions = {
             "weighted_plateau": (
-                "Global effective-range Weighted / Double Plateau mapping. Percentiles define "
-                "the input range; values outside it map to the endpoints. Upper/Lower thresholds "
-                "scale with pixel count / populated levels after percentile clamping. The lower "
+                "Global Double Plateau mapping using "
+                "the observed input minimum/maximum. Upper/Lower thresholds "
+                "scale with pixel count / populated levels of the original input. The lower "
                 "floor and optional redistribution affect populated bins only; empty bins remain "
-                "empty. W(i)=H(i)+H(i+1) is normalized over the effective range only. "
-                "Independent of Setting > Weighted mapping Automatic Clip. Constant effective "
+                "empty. Interval weights use either H'(i)+H'(i+1) or only the left bin H'(i), "
+                "and are normalized over the observed input range only; this is not an inclusive HE CDF. "
+                "Bright Weight multiplies intervals whose midpoint is at/above the selected "
+                "original-input percentile before normalization and Gain Limit. "
+                "Independent of Setting > Weighted mapping Automatic Clip. Constant input "
                 "ranges output 128. Gain Limit optionally caps the final LUT's adjacent-DN "
-                "increase while preserving percentile-clamped lower-median brightness; "
+                "increase while preserving original lower-median brightness; "
                 "no rescaling after limiting. Fractional bounds apply before 8-bit rounding."
             ),
             "linear": "Original values between Black DN and White DN are mapped linearly to 0..255.",
@@ -636,13 +653,13 @@ class ImageAlgorithmPageMixin:
 
     def current_tone_mapping_parameters(self):
         values = {
-            "plateau_mode": self.tone_plateau_mode.currentData(),
-            "plateau_low_percentile": self.tone_plateau_low_percentile.value(),
-            "plateau_high_percentile": self.tone_plateau_high_percentile.value(),
+            "plateau_weight_mode": self.tone_plateau_weight_mode.currentData(),
             "plateau_upper": self.tone_plateau_upper.value(),
             "plateau_lower": self.tone_plateau_lower.value(),
             "plateau_redistribute": self.tone_plateau_redistribute.isChecked(),
             "plateau_gain_limit": self.tone_plateau_gain_limit.value(),
+            "plateau_bright_weight": self.tone_plateau_bright_weight.currentData(),
+            "plateau_bright_percentile": self.tone_plateau_bright_percentile.value(),
             "black_dn": self.tone_black_dn.value(),
             "white_dn": self.tone_white_dn.value(),
             "low_percentile": self.tone_low_percentile.value(),
